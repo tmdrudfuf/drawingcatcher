@@ -1,0 +1,589 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=Nunito:wght@600;700;800&display=swap');
+
+    * { box-sizing: border-box; }
+    a { color: #b9612f; }
+    a:hover { color: #8a4a22; }
+
+    .board {
+      width: 1560px; height: 2860px; position: relative; overflow: hidden;
+      background: #f3efe6;
+      font-family: Nunito, system-ui, sans-serif; color: #2f2b26;
+    }
+
+    /* ---------- header ---------- */
+    .header { position: absolute; left: 60px; top: 44px; right: 60px; }
+    .htop { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+    .title { font-family: Caveat, "Comic Sans MS", cursive; font-weight: 700; font-size: 46px; line-height: 1; }
+    .subtitle { font-weight: 700; font-size: 13px; color: #6f685c; margin-top: 3px; letter-spacing: .02em; }
+    .legend { display: flex; gap: 16px; font-weight: 700; font-size: 11px; color: #6f685c; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .sw { width: 14px; height: 14px; border-radius: 5px; display: inline-block; }
+    .sw-c { background: #ec8a56; }
+    .sw-d { background: #fff; border: 2px dashed #cbc3b2; }
+    .flowmap { margin-top: 12px; font-weight: 800; font-size: 12px; color: #8a8271;
+      letter-spacing: .03em; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+    .flowmap b { color: #2f2b26; }
+    .chev { width: 11px; height: 11px; fill: none; stroke: #c0b8a5; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* ---------- phones ---------- */
+    .phone { position: absolute; width: 320px; height: 640px; background: #fff;
+      border: 2px solid #dcd6c7; border-radius: 36px; padding: 16px; overflow: hidden;
+      box-shadow: 0 12px 30px rgba(0,0,0,.07); }
+    .phone.pay { border-color: #ec8a56; box-shadow: 0 0 0 4px rgba(255,223,153,.55), 0 12px 30px rgba(0,0,0,.10); }
+    .scr { display: flex; flex-direction: column; height: 100%; gap: 10px; }
+    .spacer { flex: 1; }
+    .scr-h { font-weight: 800; font-size: 17px; text-transform: uppercase; letter-spacing: .05em; }
+
+    .badge { position: absolute; display: inline-flex; align-items: center; gap: 8px;
+      background: #2f2b26; color: #fff; font-weight: 800; font-size: 15px;
+      padding: 7px 13px; border-radius: 999px; letter-spacing: .1em; }
+    .badge span { font-weight: 700; letter-spacing: .04em; opacity: .85; text-transform: uppercase; font-size: 12px; }
+    .badge.pay { background: #ec8a56; }
+
+    /* ---------- buttons ---------- */
+    .btn-primary { background: #ec8a56; color: #fff; font-weight: 800; font-size: 15px;
+      padding: 13px 14px; border-radius: 15px; text-align: center; letter-spacing: .04em;
+      box-shadow: 0 4px 0 #b9612f; }
+    .btn-primary.big { font-size: 19px; padding: 16px; border-radius: 17px; }
+    .btn-primary.mega { display: flex; align-items: center; justify-content: center; gap: 8px;
+      font-size: 18px; padding: 16px; border-radius: 17px; box-shadow: 0 5px 0 #b9612f; }
+    .btn-ghost { border: 2px solid #cfc8b7; color: #2f2b26; background: #fff; border-radius: 13px;
+      padding: 10px 12px; font-weight: 800; font-size: 13px; text-align: center; }
+    .btn-link { color: #6f685c; font-weight: 800; font-size: 13px; text-decoration: underline; text-align: center; }
+
+    /* ---------- bits ---------- */
+    .hand { font-family: Caveat, "Comic Sans MS", cursive; font-size: 17px; color: #6f685c; }
+    .hand.big { font-size: 24px; color: #2f2b26; }
+    .card { border: 2px solid #e4dfd2; border-radius: 16px; padding: 12px; background: #fdfcf9; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; border: 2px solid #cfc8b7;
+      border-radius: 999px; padding: 4px 12px; font-weight: 800; font-size: 12px; color: #6f685c; background: #fff; }
+    .code { font-weight: 800; font-size: 20px; letter-spacing: .22em; color: #b9612f;
+      background: #fff; border: 2px solid #eccdb9; border-radius: 10px; padding: 3px 10px; }
+    .codebox { display: flex; gap: 8px; justify-content: center; }
+    .codebox span { width: 34px; height: 42px; border: 2px solid #cfc8b7; border-radius: 10px;
+      display: grid; place-items: center; font-weight: 800; font-size: 18px; background: #fff; }
+
+    .player-row { display: flex; align-items: center; justify-content: space-between;
+      border: 2px solid #e4dfd2; border-radius: 14px; padding: 10px 12px; }
+    .pl { font-weight: 800; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #9a9280; }
+    .pname { font-weight: 800; font-size: 16px; }
+    .check { display: inline-flex; align-items: center; gap: 6px; color: #4f9d6b;
+      font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .ck { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
+
+    .burst { border: 2px dashed #e0b596; border-radius: 20px; padding: 18px 12px; background: #fff8f2; text-align: center; }
+
+    .canvas-area { flex: 1; border: 2px dashed #cbc3b2; border-radius: 16px; background: #fff;
+      position: relative; display: grid; place-items: center; }
+    .timer { display: inline-flex; align-items: center; gap: 6px; font-weight: 800; font-size: 14px;
+      color: #b9612f; border: 2px solid #eccdb9; border-radius: 999px; padding: 3px 10px; }
+    .timer .mini { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+    .tools { display: flex; gap: 8px; align-items: center; }
+    .tool { width: 38px; height: 38px; border: 2px solid #cfc8b7; border-radius: 11px;
+      display: grid; place-items: center; background: #fff; }
+    .tool.on { border-color: #ec8a56; background: #fdece1; }
+    .tool svg { width: 20px; height: 20px; }
+
+    .judgecard { flex: 1; min-width: 0; border: 2px solid #e4dfd2; border-radius: 14px;
+      padding: 8px; display: flex; flex-direction: column; gap: 5px; background: #fdfcf9; }
+    .tag { display: inline-flex; align-items: center; gap: 5px; font-weight: 700; font-size: 10.5px;
+      padding: 3px 6px; border-radius: 7px; background: #fff; border: 2px solid #e4dfd2; }
+    .tag.q { border-color: #eccdb9; color: #b9612f; }
+    .tag .ck { width: 12px; height: 12px; }
+    .tag .qm { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+    .bar { height: 12px; border: 2px solid #cfc8b7; border-radius: 999px; background: #fff; overflow: hidden; }
+    .bar i { display: block; width: 64%; height: 100%; background: #ec8a56; }
+
+    .rescard { flex: 1; min-width: 0; border: 2px solid #e4dfd2; border-radius: 14px;
+      padding: 10px; text-align: center; background: #fdfcf9; }
+    .rescard.win { border-color: #ec8a56; background: #fdf1ea; }
+    .score { font-weight: 800; font-size: 32px; line-height: 1; }
+    .speech { position: relative; background: #fff; border: 2px solid #cfc8b7; border-radius: 14px;
+      padding: 9px 11px; font-family: Caveat, "Comic Sans MS", cursive; font-size: 17px; }
+    .speech::after { content: ""; position: absolute; left: 24px; bottom: -9px; width: 14px; height: 14px;
+      background: #fff; border-right: 2px solid #cfc8b7; border-bottom: 2px solid #cfc8b7; transform: rotate(45deg); }
+    .spark { width: 16px; height: 16px; fill: #fff2c9; }
+
+    .reveal { border: 2px dashed #e0b596; border-radius: 16px; padding: 10px; background: #fff8f2;
+      display: flex; flex-direction: column; align-items: center; gap: 4px; }
+    .rl { text-align: center; }
+    .rl.on { background: #fdece1; border-radius: 12px; padding: 4px 8px; }
+    .down { width: 22px; height: 22px; fill: none; stroke: #b9612f; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+    .chips { display: flex; flex-wrap: wrap; gap: 5px; justify-content: center; }
+    .play { width: 12px; height: 12px; fill: #b9612f; vertical-align: middle; }
+
+    .obs { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 12px;
+      text-transform: uppercase; letter-spacing: .04em; color: #2f2b26; }
+    .obs b { color: #b9612f; }
+    .obs .ck { width: 13px; height: 13px; color: #4f9d6b; }
+    .obs .dot { font-family: Caveat, "Comic Sans MS", cursive; font-size: 20px; line-height: 0; color: #b9612f; }
+    .judgethumb { text-align: center; }
+    .judgethumb .pl { margin-bottom: 3px; }
+    .big-reveal { flex: 1; position: relative; border: 2px dashed #e0b596; border-radius: 16px;
+      background: #fff8f2; display: grid; place-items: center; overflow: hidden; }
+    .ref-inset { position: absolute; left: 10px; top: 8px; text-align: center; }
+    .ref-inset .pl { font-size: 9px; }
+    .mlabel { position: absolute; font-family: Caveat, "Comic Sans MS", cursive; font-size: 13px;
+      color: #9a9280; background: #fff8f2; padding: 0 3px; }
+
+    .cat { display: block; }
+
+    /* ---------- flow arrows ---------- */
+    .flow { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; }
+
+    /* ---------- principle callout ---------- */
+    .principle { position: absolute; left: 60px; top: 2588px; width: 1440px;
+      display: flex; gap: 24px; align-items: center;
+      background: #fff; border: 2px solid #2f2b26; border-radius: 20px; padding: 18px 22px; }
+    .pr-left { flex: 1; }
+    .pr-h { font-family: Caveat, "Comic Sans MS", cursive; font-weight: 700; font-size: 32px; line-height: 1; }
+    .pr-sub { font-weight: 600; font-size: 13px; color: #6f685c; margin-top: 6px; max-width: 540px; }
+    .pr-right { display: flex; gap: 18px; }
+    .pr-ex { display: flex; align-items: center; gap: 6px; border: 2px solid #e4dfd2;
+      border-radius: 14px; padding: 10px; background: #fdfcf9; }
+    .pr-ex .cat { width: 74px; height: 58px; }
+    .pr-ex .down.mini { width: 16px; height: 16px; }
+    .pr-ex.ok { border-color: #bfe0cd; }
+    .pr-ex.bad { border-color: #eccdb9; }
+    .lbl { display: flex; align-items: center; gap: 5px; font-weight: 800; font-size: 11px;
+      text-transform: uppercase; letter-spacing: .03em; }
+    .lbl.good { color: #4f9d6b; }
+    .lbl.no { color: #b9612f; }
+    .xic { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; }
+  </style>
+</helmet>
+
+<div class="board">
+
+  <!-- reusable badly-drawn cat -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+
+    <symbol id="catBad" viewBox="0 0 150 120">
+      <g fill="none" stroke="#2f2b26" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+        <ellipse cx="80" cy="76" rx="48" ry="31"/>
+        <circle cx="42" cy="44" r="18"/>
+        <path d="M26 34 L33 12 L45 32 Z"/>
+        <path d="M45 31 L56 13 L65 33 Z"/>
+        <path d="M29 49 L9 45 M29 52 L8 54 M30 55 L10 61"/>
+        <path d="M56 48 L71 44 M56 51 L72 53"/>
+        <path d="M54 104 L53 116 M76 106 L76 117 M100 105 L102 116 M120 101 L122 113"/>
+        <path d="M126 80 C150 72 148 30 133 20"/>
+        <path d="M44 92 q34 12 72 0" opacity="0.4"/>
+        <path d="M45 53 q4 4 9 2"/>
+      </g>
+      <circle cx="37" cy="44" r="2.8" fill="#2f2b26"/>
+      <circle cx="49" cy="41" r="1.8" fill="#2f2b26"/>
+      <path d="M41 50 l4 0 l-2 3 Z" fill="#2f2b26"/>
+    </symbol>
+
+    <symbol id="catChar" viewBox="0 0 150 120">
+      <ellipse cx="80" cy="116" rx="46" ry="5" fill="#0000000f"/>
+      <ellipse cx="80" cy="76" rx="48" ry="31" fill="#d3cec1" stroke="#2f2b26" stroke-width="3"/>
+      <circle cx="42" cy="44" r="18" fill="#ddd8cb" stroke="#2f2b26" stroke-width="3"/>
+      <g fill="none" stroke="#2f2b26" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M26 34 L33 12 L45 32 Z"/>
+        <path d="M45 31 L56 13 L65 33 Z"/>
+        <path d="M29 49 L11 45 M29 52 L10 54"/>
+        <path d="M56 48 L71 44 M56 51 L72 53"/>
+        <path d="M54 104 L53 114 M76 106 L76 115 M100 105 L102 114 M120 101 L122 111"/>
+        <path d="M126 80 C150 72 148 30 133 20"/>
+      </g>
+      <path d="M40 110 q7 5 14 0 M66 112 q7 5 14 0 M96 110 q7 5 14 0" fill="none" stroke="#2f2b26" stroke-width="2" opacity="0.4"/>
+      <path d="M138 18 q7 -4 11 -12 M139 28 q9 -3 15 -9" fill="none" stroke="#2f2b26" stroke-width="2" opacity="0.4"/>
+      <path d="M16 14 l0 9 M11 18 l9 0" stroke="#2f2b26" stroke-width="2.6" stroke-linecap="round"/>
+      <circle cx="37" cy="44" r="2.8" fill="#2f2b26"/>
+      <path d="M46 41 l5 0" stroke="#2f2b26" stroke-width="2.6" stroke-linecap="round"/>
+      <path d="M41 50 l4 0 l-2 3 Z" fill="#2f2b26"/>
+    </symbol>
+
+    <symbol id="catPretty" viewBox="0 0 150 120">
+      <path d="M40 100 Q28 62 48 44 L40 22 L60 40 Q75 36 90 40 L110 22 L102 44 Q122 62 110 100 Q95 112 75 112 Q55 112 40 100 Z"
+        fill="#e9e5da" stroke="#2f2b26" stroke-width="3" stroke-linejoin="round"/>
+      <g fill="none" stroke="#2f2b26" stroke-width="3" stroke-linecap="round">
+        <path d="M96 96 Q120 86 112 52"/>
+        <path d="M52 104 L52 114 M66 106 L66 116 M84 106 L84 116 M98 104 L98 114"/>
+        <path d="M66 60 l-8 -3 M82 60 l8 -3" stroke-width="2"/>
+        <path d="M70 70 q4 4 8 0" stroke-width="2.6"/>
+      </g>
+      <circle cx="62" cy="62" r="3.2" fill="#2f2b26"/>
+      <circle cx="86" cy="62" r="3.2" fill="#2f2b26"/>
+    </symbol>
+
+    <!-- Player 2: oversized head, tiny body, long thin legs, crooked zigzag tail, surprised face -->
+    <symbol id="catBad2" viewBox="0 0 150 120">
+      <g fill="none" stroke="#2f2b26" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+        <ellipse cx="84" cy="84" rx="24" ry="15"/>
+        <circle cx="60" cy="44" r="30"/>
+        <path d="M40 24 L44 3 L58 22 Z"/>
+        <path d="M66 21 L82 3 L88 25 Z"/>
+        <path d="M40 52 L24 49 M40 55 L25 59"/>
+        <path d="M80 50 L96 47 M80 53 L95 57"/>
+      </g>
+      <g fill="none" stroke="#2f2b26" stroke-width="2" stroke-linecap="round">
+        <path d="M70 96 L60 119"/>
+        <path d="M80 98 L78 119"/>
+        <path d="M90 97 L98 118"/>
+        <path d="M98 94 L110 116"/>
+      </g>
+      <path d="M104 82 L118 76 L112 64 L124 58 L118 47" fill="none" stroke="#2f2b26" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="50" cy="45" r="4.6" fill="none" stroke="#2f2b26" stroke-width="2.4"/>
+      <circle cx="70" cy="42" r="5.4" fill="none" stroke="#2f2b26" stroke-width="2.4"/>
+      <circle cx="50" cy="45" r="1.6" fill="#2f2b26"/>
+      <circle cx="70" cy="42" r="1.8" fill="#2f2b26"/>
+      <ellipse cx="60" cy="60" rx="3.4" ry="4.4" fill="none" stroke="#2f2b26" stroke-width="2.4"/>
+    </symbol>
+
+    <symbol id="catChar2" viewBox="0 0 150 120">
+      <ellipse cx="82" cy="116" rx="34" ry="4.5" fill="#0000000f"/>
+      <ellipse cx="84" cy="84" rx="24" ry="15" fill="#d3cec1" stroke="#2f2b26" stroke-width="3"/>
+      <circle cx="60" cy="44" r="30" fill="#ddd8cb" stroke="#2f2b26" stroke-width="3"/>
+      <g fill="none" stroke="#2f2b26" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M40 24 L44 3 L58 22 Z"/>
+        <path d="M66 21 L82 3 L88 25 Z"/>
+      </g>
+      <g fill="none" stroke="#2f2b26" stroke-width="2" stroke-linecap="round">
+        <path d="M70 96 L62 118"/>
+        <path d="M80 98 L79 119"/>
+        <path d="M90 97 L97 118"/>
+        <path d="M98 94 L108 116"/>
+      </g>
+      <path d="M104 82 L118 76 L112 64 L124 58 L118 47" fill="none" stroke="#2f2b26" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M56 119 q6 4 12 0 M86 120 q6 4 12 0" fill="none" stroke="#2f2b26" stroke-width="2" opacity="0.4"/>
+      <path d="M120 44 q7 -3 10 -10 M122 54 q9 -2 14 -8" fill="none" stroke="#2f2b26" stroke-width="2" opacity="0.4"/>
+      <path d="M20 16 l0 9 M15 20 l9 0" stroke="#2f2b26" stroke-width="2.6" stroke-linecap="round"/>
+      <circle cx="50" cy="45" r="4.6" fill="none" stroke="#2f2b26" stroke-width="2.4"/>
+      <path d="M64 40 l10 0" stroke="#2f2b26" stroke-width="2.4" stroke-linecap="round"/>
+      <circle cx="50" cy="45" r="1.6" fill="#2f2b26"/>
+      <ellipse cx="60" cy="60" rx="3.4" ry="4.4" fill="none" stroke="#2f2b26" stroke-width="2.4"/>
+    </symbol>
+
+  </defs></svg>
+
+  <!-- ================= HEADER ================= -->
+  <div class="header">
+    <div class="htop">
+      <div>
+        <div class="title">AI Sketch Game</div>
+        <div class="subtitle">First-round wireflow &middot; low-fidelity UX exploration</div>
+      </div>
+      <div class="legend">
+        <span><i class="sw sw-c"></i>primary action</span>
+        <span><svg class="ck" viewBox="0 0 16 16" style="color:#4f9d6b"><path d="M3 8.5 L6.5 12 L13 4"/></svg>ready / confirmed</span>
+        <span><i class="sw sw-d"></i>placeholder / sketch area</span>
+      </div>
+    </div>
+    <div class="flowmap">
+      <b>01</b>&nbsp;Home <svg class="chev" viewBox="0 0 12 12"><path d="M4 2 L8 6 L4 10"/></svg>
+      <b>02</b>&nbsp;Create / Join <svg class="chev" viewBox="0 0 12 12"><path d="M4 2 L8 6 L4 10"/></svg>
+      <b>03</b>&nbsp;Lobby <svg class="chev" viewBox="0 0 12 12"><path d="M4 2 L8 6 L4 10"/></svg>
+      <b>04</b>&nbsp;Prompt <svg class="chev" viewBox="0 0 12 12"><path d="M4 2 L8 6 L4 10"/></svg>
+      <b>05</b>&nbsp;Draw <svg class="chev" viewBox="0 0 12 12"><path d="M4 2 L8 6 L4 10"/></svg>
+      <b>06</b>&nbsp;AI Judge <svg class="chev" viewBox="0 0 12 12"><path d="M4 2 L8 6 L4 10"/></svg>
+      <b>07</b>&nbsp;Results <svg class="chev" viewBox="0 0 12 12"><path d="M4 2 L8 6 L4 10"/></svg>
+      <b>08</b>&nbsp;Animated Reveal <svg class="chev" viewBox="0 0 12 12"><path d="M4 2 L8 6 L4 10"/></svg>
+      <b>09</b>&nbsp;Next Round
+    </div>
+  </div>
+
+  <!-- ================= BADGES ================= -->
+  <div class="badge" style="left:60px; top:230px">01 <span>Home</span></div>
+  <div class="badge" style="left:620px; top:230px">02 <span>Create / Join</span></div>
+  <div class="badge" style="left:1180px; top:230px">03 <span>Duo Lobby</span></div>
+  <div class="badge" style="left:1180px; top:1040px">04 <span>Prompt Reveal</span></div>
+  <div class="badge" style="left:620px; top:1040px">05 <span>Drawing Canvas</span></div>
+  <div class="badge" style="left:60px; top:1040px">06 <span>AI Judge</span></div>
+  <div class="badge" style="left:60px; top:1850px">07 <span>Results</span></div>
+  <div class="badge pay" style="left:620px; top:1850px">08 <span>Animated Reveal</span></div>
+  <div class="badge" style="left:1180px; top:1850px">09 <span>Next Round</span></div>
+
+  <!-- ================= 01 HOME ================= -->
+  <div class="phone" style="left:60px; top:270px">
+    <div class="scr" style="text-align:center">
+      <div class="spacer"></div>
+      <div style="font-family:Caveat,'Comic Sans MS',cursive; font-weight:700; font-size:46px; line-height:.95">AI Sketch<br>Game</div>
+      <div class="hand" style="margin-top:2px">draw &middot; let AI judge &middot; bring it to life</div>
+      <div style="display:grid; place-items:center; margin:8px 0">
+        <svg class="cat" viewBox="0 0 150 120" style="width:140px; height:110px"><use href="#catBad"/></svg>
+      </div>
+      <div class="spacer"></div>
+      <div class="btn-primary big">PLAY</div>
+      <div class="btn-link">How to Play</div>
+      <div class="hand" style="font-size:15px; opacity:.8">no login &mdash; just play</div>
+      <div class="spacer"></div>
+    </div>
+  </div>
+
+  <!-- ================= 02 CREATE / JOIN ================= -->
+  <div class="phone" style="left:620px; top:270px">
+    <div class="scr">
+      <div class="scr-h">Start a game</div>
+      <div class="hand" style="font-size:15px">host one, or hop into a friend&#39;s</div>
+      <div class="spacer"></div>
+      <div class="card" style="border-color:#ec8a56; background:#fdf1ea">
+        <div class="btn-primary">CREATE GAME</div>
+        <div style="display:flex; align-items:center; gap:8px; justify-content:center; margin-top:10px">
+          <span class="hand" style="font-size:15px">your room code</span>
+          <span class="code">4827</span>
+        </div>
+      </div>
+      <div class="hand" style="text-align:center">&mdash; or &mdash;</div>
+      <div class="card">
+        <div class="btn-ghost">JOIN GAME</div>
+        <div class="codebox" style="margin-top:10px">
+          <span>4</span><span>8</span><span>_</span><span>_</span>
+        </div>
+        <div class="hand" style="font-size:14px; text-align:center; margin-top:6px">type the 4-digit code</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="hand" style="font-size:15px; text-align:center; opacity:.8">no accounts &middot; takes 2 seconds</div>
+    </div>
+  </div>
+
+  <!-- ================= 03 DUO LOBBY ================= -->
+  <div class="phone" style="left:1180px; top:270px">
+    <div class="scr">
+      <div class="scr-h">Duo Lobby</div>
+      <div style="display:flex; align-items:baseline; gap:8px">
+        <span class="hand" style="font-size:15px">room</span>
+        <span class="code">4827</span>
+      </div>
+      <div class="spacer"></div>
+      <div class="player-row">
+        <div><div class="pl">Player 1</div><div class="pname">KY</div></div>
+        <div class="check"><svg class="ck" viewBox="0 0 16 16"><path d="M3 8.5 L6.5 12 L13 4"/></svg>ready</div>
+      </div>
+      <div class="player-row">
+        <div><div class="pl">Player 2</div><div class="pname">FRIEND</div></div>
+        <div class="check"><svg class="ck" viewBox="0 0 16 16"><path d="M3 8.5 L6.5 12 L13 4"/></svg>ready</div>
+      </div>
+      <div class="hand big" style="text-align:center; margin-top:4px">Both players ready!</div>
+      <div class="hand" style="font-size:14px; text-align:center; opacity:.8">2 players &middot; share one phone or sit side by side</div>
+      <div class="spacer"></div>
+      <div class="btn-primary big">START ROUND</div>
+    </div>
+  </div>
+
+  <!-- ================= 04 PROMPT REVEAL ================= -->
+  <div class="phone" style="left:1180px; top:1080px">
+    <div class="scr" style="text-align:center">
+      <div class="scr-h">Prompt</div>
+      <div class="spacer"></div>
+      <div class="burst">
+        <div style="display:flex; gap:8px; align-items:center; justify-content:center">
+          <svg class="cat" viewBox="0 0 150 120" style="width:46px; height:37px"><use href="#catBad"/></svg>
+          <span style="font-family:Caveat,'Comic Sans MS',cursive; font-weight:700; font-size:40px">DRAW A CAT</span>
+        </div>
+        <div class="pill" style="margin-top:12px">
+          <svg class="mini" viewBox="0 0 16 16" style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><circle cx="8" cy="8" r="6"/><path d="M8 5 V8 L10 10"/></svg>
+          30 SECONDS
+        </div>
+      </div>
+      <div class="hand" style="margin-top:16px; font-size:16px">&ldquo;Make it recognizable.<br>Or don&#39;t. The AI will decide.&rdquo;</div>
+      <div class="spacer"></div>
+      <div class="btn-primary big">START DRAWING</div>
+    </div>
+  </div>
+
+  <!-- ================= 05 DRAWING CANVAS ================= -->
+  <div class="phone" style="left:620px; top:1080px">
+    <div class="scr">
+      <div style="display:flex; align-items:center; justify-content:space-between">
+        <div class="scr-h">Draw a Cat</div>
+        <div class="timer">
+          <svg class="mini" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 5 V8 L10 10"/></svg>
+          00:18
+        </div>
+      </div>
+      <div class="canvas-area">
+        <svg class="cat" viewBox="0 0 150 120" style="width:190px; height:150px"><use href="#catBad"/></svg>
+        <svg viewBox="0 0 24 24" style="position:absolute; left:16px; top:16px; width:22px; height:22px"><path d="M3 21 L6 20 L20 6 L18 4 L4 18 Z" fill="#2f2b26"/></svg>
+        <div class="hand" style="position:absolute; right:10px; bottom:8px; font-size:14px; transform:rotate(-4deg)">wobbly is good</div>
+      </div>
+      <div class="tools">
+        <div class="tool on"><svg viewBox="0 0 20 20"><path d="M3 17 L5 16 L16 5 L15 4 L4 15 Z" fill="#b9612f"/></svg></div>
+        <div class="tool"><svg viewBox="0 0 20 20"><rect x="4" y="9" width="9" height="7" rx="2" transform="rotate(-20 8 12)" fill="none" stroke="#2f2b26" stroke-width="2"/></svg></div>
+        <div class="tool"><svg viewBox="0 0 20 20"><path d="M7 6 H12 a4 4 0 1 1 -4 4 M7 6 L10 3 M7 6 L10 9" fill="none" stroke="#2f2b26" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <div class="tool"><svg viewBox="0 0 20 20"><path d="M4 6 H16 M7 6 V15 H13 V6 M8.5 6 V4 H11.5 V6" fill="none" stroke="#2f2b26" stroke-width="2" stroke-linejoin="round"/></svg></div>
+        <div class="hand" style="align-self:center; font-size:13px; margin-left:2px">pen &middot; eraser &middot; undo &middot; clear</div>
+      </div>
+      <div class="btn-primary big">SUBMIT</div>
+    </div>
+  </div>
+
+  <!-- ================= 06 AI JUDGE ================= -->
+  <div class="phone" style="left:60px; top:1080px">
+    <div class="scr">
+      <div class="scr-h">AI Judge</div>
+      <div class="hand big" style="text-align:center">AI is judging&hellip;</div>
+      <div style="display:flex; gap:14px; justify-content:center">
+        <div class="judgethumb"><div class="pl">P1</div><svg class="cat" viewBox="0 0 150 120" style="width:104px; height:82px"><use href="#catBad"/></svg></div>
+        <div class="judgethumb"><div class="pl">P2</div><svg class="cat" viewBox="0 0 150 120" style="width:104px; height:82px"><use href="#catBad2"/></svg></div>
+      </div>
+      <div class="card" style="border:2px dashed #e0b596; background:#fff8f2; display:flex; flex-direction:column; gap:10px">
+        <div class="obs"><svg class="ck" viewBox="0 0 16 16"><path d="M3 8.5 L6.5 12 L13 4"/></svg>Cat detected</div>
+        <div class="obs">Tiny legs detected<span class="dot">&hellip;</span></div>
+        <div class="obs">Anatomy: <b>questionable</b></div>
+        <div class="obs">Artistic confidence: <b>somehow high</b></div>
+      </div>
+      <div class="spacer"></div>
+      <div class="hand" style="text-align:center; font-size:16px">CALCULATING SCORES&hellip;</div>
+      <div class="bar"><i></i></div>
+    </div>
+  </div>
+
+  <!-- ================= 07 RESULTS ================= -->
+  <div class="phone" style="left:60px; top:1890px">
+    <div class="scr">
+      <div class="scr-h">Results</div>
+      <div style="display:flex; gap:8px">
+        <div class="rescard win">
+          <div class="pl">Player 1</div>
+          <svg class="cat" viewBox="0 0 150 120" style="width:100%; height:90px"><use href="#catBad"/></svg>
+          <div class="score">87
+            <svg viewBox="0 0 20 20" style="width:15px; height:15px; fill:none; stroke:#d99a2e; stroke-width:1.6; stroke-linejoin:round; vertical-align:middle"><path d="M6 3 H14 V7 A4 4 0 0 1 6 7 Z"/><path d="M6 4 H3 A3 3 0 0 0 6 8"/><path d="M14 4 H17 A3 3 0 0 1 14 8"/><path d="M10 11 V13 M7 17 H13 L12 13 H8 Z"/></svg>
+          </div>
+        </div>
+        <div class="rescard">
+          <div class="pl">Player 2</div>
+          <svg class="cat" viewBox="0 0 150 120" style="width:100%; height:90px"><use href="#catBad2"/></svg>
+          <div class="score" style="color:#9a9280">74</div>
+        </div>
+      </div>
+      <div class="hand" style="text-align:center; font-size:26px; font-weight:700; color:#b9612f">PLAYER 1 WINS!</div>
+      <div class="speech">&ldquo;Those tiny legs somehow made the cat more powerful.&rdquo;</div>
+      <div class="spacer"></div>
+      <div class="btn-primary mega">
+        <svg class="spark" viewBox="0 0 20 20"><path d="M10 1 L12 8 L19 10 L12 12 L10 19 L8 12 L1 10 L8 8 Z"/></svg>
+        BRING THEM TO LIFE
+        <svg class="spark" viewBox="0 0 20 20"><path d="M10 1 L12 8 L19 10 L12 12 L10 19 L8 12 L1 10 L8 8 Z"/></svg>
+      </div>
+      <div class="hand" style="text-align:center; font-size:14px; opacity:.85">the round isn&#39;t over yet &mdash;</div>
+    </div>
+  </div>
+
+  <!-- ================= 08 ANIMATED REVEAL ================= -->
+  <div class="phone pay" style="left:620px; top:1890px">
+    <div class="scr">
+      <div style="display:flex; align-items:center; justify-content:space-between">
+        <div class="scr-h">Animated Reveal</div>
+        <div class="pill" style="border-color:#e6c27a; color:#8a6d1f; background:#fff6e2">
+          <svg viewBox="0 0 16 16" style="width:12px;height:12px;fill:currentColor"><path d="M8 1 L10 6 L15 6 L11 9 L12 14 L8 11 L4 14 L5 9 L1 6 L6 6 Z"/></svg>
+          the payoff
+        </div>
+      </div>
+      <div class="hand big" style="text-align:center; color:#b9612f; line-height:1.05">THAT weird drawing<br>is now alive.</div>
+      <div class="big-reveal">
+        <div class="ref-inset">
+          <div class="pl">your sketch</div>
+          <svg class="cat" viewBox="0 0 150 120" style="width:58px; height:46px"><use href="#catBad"/></svg>
+        </div>
+        <svg class="cat" viewBox="0 0 150 120" style="width:214px; height:170px"><use href="#catChar"/></svg>
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" style="position:absolute; inset:0; width:100%; height:100%; pointer-events:none; overflow:visible">
+          <g fill="none" stroke="#d3a884" stroke-width="1.4" stroke-linecap="round">
+            <path d="M78 40 q10 -6 8 -20"/>
+            <path d="M83 46 q14 -4 15 -20"/>
+            <path d="M42 86 q-16 10 -34 3"/>
+            <path d="M58 86 q16 10 34 3"/>
+            <path d="M30 30 q-8 -3 -12 -11"/>
+          </g>
+        </svg>
+        <div class="mlabel" style="top:12px; right:10px">blink</div>
+        <div class="mlabel" style="top:42%; right:4px">tail wag</div>
+        <div class="mlabel" style="left:6px; bottom:38px">stumble</div>
+        <div class="mlabel" style="left:70px; bottom:8px">waddle waddle</div>
+      </div>
+      <div class="chips">
+        <span class="tag">same silhouette</span>
+        <span class="tag">tiny legs kept</span>
+        <span class="tag">crooked face kept</span>
+        <span class="tag">raised tail kept</span>
+      </div>
+      <div class="hand" style="text-align:center; font-size:13px">
+        <svg class="play" viewBox="0 0 16 16"><path d="M4 3 L13 8 L4 13 Z"/></svg>
+        3&ndash;5s loop &middot; waddles &middot; blinks &middot; tail wag &middot; stumbles
+      </div>
+      <div style="display:flex; gap:8px">
+        <div class="btn-ghost" style="flex:1">REPLAY</div>
+        <div class="btn-ghost" style="flex:1">SHARE</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= 09 NEXT ROUND ================= -->
+  <div class="phone" style="left:1180px; top:1890px">
+    <div class="scr" style="text-align:center">
+      <div class="scr-h">Next Round</div>
+      <div class="spacer"></div>
+      <div style="display:flex; justify-content:center; align-items:flex-end; gap:10px">
+        <div style="text-align:center">
+          <svg class="cat" viewBox="0 0 150 120" style="width:128px; height:101px"><use href="#catChar"/></svg>
+          <div class="pl">Player 1</div>
+        </div>
+        <div style="text-align:center">
+          <svg class="cat" viewBox="0 0 150 120" style="width:120px; height:95px"><use href="#catChar2"/></svg>
+          <div class="pl">Player 2</div>
+        </div>
+      </div>
+      <div class="hand big">ROUND COMPLETE!</div>
+      <div class="hand" style="font-size:20px; color:#b9612f">One more?</div>
+      <div class="spacer"></div>
+      <div class="btn-primary mega">NEXT ROUND</div>
+      <div class="btn-link" style="opacity:.7">End game</div>
+    </div>
+  </div>
+
+  <!-- ================= FLOW ARROWS ================= -->
+  <svg class="flow" viewBox="0 0 1560 2860" width="1560" height="2860">
+    <defs>
+      <marker id="ah" markerWidth="12" markerHeight="12" refX="8" refY="5" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 L3 5 Z" fill="#b3ab99"/>
+      </marker>
+    </defs>
+    <g fill="none" stroke="#b3ab99" stroke-width="2.6" stroke-linecap="round" marker-end="url(#ah)">
+      <path d="M382 590 q120 -16 236 0"/>
+      <path d="M942 590 q120 -16 236 0"/>
+      <path d="M1340 912 q16 84 0 166"/>
+      <path d="M1178 1400 q-120 16 -236 0"/>
+      <path d="M618 1400 q-120 16 -236 0"/>
+      <path d="M220 1722 q16 84 0 166"/>
+      <path d="M382 2210 q120 -16 236 0"/>
+      <path d="M942 2210 q120 -16 236 0"/>
+    </g>
+  </svg>
+
+  <!-- ================= PRINCIPLE CALLOUT ================= -->
+  <div class="principle">
+    <div class="pr-left">
+      <div class="pr-h">Preserve first. Stylize second.</div>
+      <div class="pr-sub">The wobbles, wrong proportions and mistakes <b>are</b> the character. &ldquo;Bring&nbsp;Them&nbsp;to&nbsp;Life&rdquo; exaggerates them into personality &mdash; it never corrects them. The same lopsided cat rides screens 05&rarr;09.</div>
+    </div>
+    <div class="pr-right">
+      <div class="pr-ex ok">
+        <svg class="cat" viewBox="0 0 150 120"><use href="#catBad"/></svg>
+        <svg class="down mini" viewBox="0 0 24 24"><path d="M12 3 L12 20 M5 13 L12 20 L19 13"/></svg>
+        <svg class="cat" viewBox="0 0 150 120"><use href="#catChar"/></svg>
+        <div class="lbl good"><svg class="ck" viewBox="0 0 16 16"><path d="M3 8.5 L6.5 12 L13 4"/></svg>identity kept</div>
+      </div>
+      <div class="pr-ex bad">
+        <svg class="cat" viewBox="0 0 150 120"><use href="#catBad"/></svg>
+        <svg class="down mini" viewBox="0 0 24 24"><path d="M12 3 L12 20 M5 13 L12 20 L19 13"/></svg>
+        <svg class="cat" viewBox="0 0 150 120"><use href="#catPretty"/></svg>
+        <div class="lbl no"><svg class="xic" viewBox="0 0 16 16"><path d="M4 4 L12 12 M12 4 L4 12"/></svg>generic &mdash; never this</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+</body>
+</html>
