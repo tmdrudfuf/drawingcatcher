@@ -24,7 +24,7 @@ export function HomeScreen() {
           lineHeight: 44,
         }}
       >
-        AI{'\n'}Sketch{'\n'}Game
+        Drawing{'\n'}Catcher
       </Text>
       <Text style={{ fontSize: 15, color: colors.sub }}>draw · let AI judge · bring it to life</Text>
 

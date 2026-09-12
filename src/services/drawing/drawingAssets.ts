@@ -10,6 +10,8 @@ import type { PlayerDrawing } from '@/types/game';
  */
 
 export const DRAWINGS_BUCKET = 'drawings';
+/** Milestone 4A: real Gemini output lives in its own bucket, never overwriting the original. */
+export const CHARACTERIZED_BUCKET = 'characterized';
 
 export interface DrawingAssetRef {
   gameId: string;
@@ -49,6 +51,13 @@ export function publicDrawingUrl(path: string | null | undefined): string | null
   if (!path) return null;
   if (!supabase) return null;
   return supabase.storage.from(DRAWINGS_BUCKET).getPublicUrl(path).data.publicUrl;
+}
+
+/** Public URL for a Gemini-characterized asset, or null when none exists yet. */
+export function publicCharacterizedUrl(path: string | null | undefined): string | null {
+  if (!path) return null;
+  if (!supabase) return null;
+  return supabase.storage.from(CHARACTERIZED_BUCKET).getPublicUrl(path).data.publicUrl;
 }
 
 /**

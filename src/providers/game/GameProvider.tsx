@@ -109,6 +109,44 @@ function remotePlayersForState(remote: RoomSnapshot | null): [Player, Player] {
   return [first, second];
 }
 
+/**
+ * Milestone 4B: builds the displayed JudgeRoundResult from the real Gemini
+ * judge's persisted scores/comment/reasons. `players` is already slot-sorted
+ * (remotePlayersForState), and the judge-round Edge Function's player1/player2
+ * naming is likewise slot 1/slot 2 — so this mapping is positional, not an id
+ * lookup, matching the same convention buildDeterministicJudgeResult below
+ * already uses.
+ */
+function buildRealJudgeResult(players: [Player, Player], remote: RoomSnapshot): JudgeRoundResult {
+  const summary = remote.judgeSummary!;
+  return {
+    players: [
+      {
+        playerId: players[0].id,
+        score: summary.player1Score,
+        recognized: true,
+        observations: summary.player1Reason ? [summary.player1Reason] : [],
+      },
+      {
+        playerId: players[1].id,
+        score: summary.player2Score,
+        recognized: true,
+        observations: summary.player2Reason ? [summary.player2Reason] : [],
+      },
+    ],
+    winnerPlayerId: remote.winnerPlayerId ?? players[0].id,
+    comment: summary.comment,
+    suspenseCues: [],
+  };
+}
+
+/**
+ * Fallback-only, Milestone 4B onward: used when a round was force-advanced
+ * via the complete_fake_judging RPC (the client's recovery path when real
+ * Gemini judging fails or times out — see JudgeScreen) and therefore has no
+ * real judge data to show. Deterministic placeholder, not a claim of an
+ * actual AI verdict.
+ */
 function buildDeterministicJudgeResult(players: [Player, Player], winnerPlayerId?: string | null): JudgeRoundResult {
   const winner = winnerPlayerId ?? players[0].id;
   return {
@@ -158,6 +196,13 @@ export interface GameContextValue {
   submitDrawings: (pngBase64?: string) => Promise<boolean>;
   /** Local data: URI of this device's own submitted drawing — shown without re-download. */
   localDrawingUri: string | null;
+  /**
+   * Milestone 4B: force-advances the round via the deterministic
+   * complete_fake_judging RPC. No longer the primary judging path — the real
+   * Gemini judge-round Edge Function now does that (and advances the round
+   * itself on success). JudgeScreen calls this only as the failure-recovery
+   * action when real judging fails or times out, so the round is never stuck.
+   */
   completeRemoteJudging: () => Promise<void>;
   markRemoteReveal: () => Promise<void>;
   reportJudgeResult: (result: JudgeRoundResult) => void;
@@ -210,7 +255,9 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     const players = remotePlayersForState(remoteRoom);
     const judgeResult =
       remoteRoom.phase === 'results' || remoteRoom.phase === 'reveal' || remoteRoom.phase === 'complete'
-        ? buildDeterministicJudgeResult(players, remoteRoom.winnerPlayerId)
+        ? remoteRoom.judgeSummary
+          ? buildRealJudgeResult(players, remoteRoom)
+          : buildDeterministicJudgeResult(players, remoteRoom.winnerPlayerId)
         : null;
 
     return {

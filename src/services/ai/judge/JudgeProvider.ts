@@ -1,8 +1,20 @@
 import type { PlayerDrawing, PlayerId } from '@/types/game';
 
+export interface JudgeContext {
+  gameId: string;
+  roundId: string;
+}
+
 export interface JudgeRoundInput {
   prompt: string;
   drawings: PlayerDrawing[];
+  /**
+   * Milestone 4B: present only for Supabase-backed rounds. Lets a real
+   * provider locate both uploaded drawings and judge server-side — the
+   * client never handles raw image bytes for this call. Absent in
+   * local/fake-only mode, which is how the router picks a provider.
+   */
+  context?: JudgeContext;
 }
 
 export interface JudgePlayerResult {
@@ -22,7 +34,8 @@ export interface JudgeRoundResult {
 
 /**
  * Provider boundary (docs/MVP_ARCHITECTURE.md §Provider Boundary).
- * Real implementations later: GeminiJudgeProvider, OpenAIJudgeProvider.
+ * Real implementation (Milestone 4B): GeminiJudgeProvider, which never talks
+ * to Google directly — it calls the `judge-round` Supabase Edge Function.
  */
 export interface JudgeProvider {
   judgeRound(input: JudgeRoundInput): Promise<JudgeRoundResult>;

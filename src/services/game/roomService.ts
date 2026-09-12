@@ -36,6 +36,20 @@ interface RoundRow {
   prompt: string;
   status: RemoteRoundStatus;
   winner_player_id: string | null;
+  judge_player1_score: number | null;
+  judge_player2_score: number | null;
+  judge_comment: string | null;
+  judge_player1_reason: string | null;
+  judge_player2_reason: string | null;
+}
+
+/** Milestone 4B: the real Gemini judge's persisted result for a round, once complete. */
+export interface JudgeSummary {
+  player1Score: number;
+  player2Score: number;
+  comment: string;
+  player1Reason: string | null;
+  player2Reason: string | null;
 }
 
 interface SubmissionRow {
@@ -65,6 +79,8 @@ export interface RoomSnapshot {
   phase: RoundPhase;
   players: RemotePlayer[];
   winnerPlayerId: string | null;
+  /** Real Gemini judge result once judging completes; null while pending or if this round was force-advanced without one. */
+  judgeSummary: JudgeSummary | null;
 }
 
 export type RoomListener = (snapshot: RoomSnapshot) => void;
@@ -137,7 +153,9 @@ export async function fetchRoomSnapshot(gameId: string): Promise<RoomSnapshot> {
       .returns<GamePlayerRow[]>(),
     client
       .from('rounds')
-      .select('id, game_id, round_number, prompt, status, winner_player_id')
+      .select(
+        'id, game_id, round_number, prompt, status, winner_player_id, judge_player1_score, judge_player2_score, judge_comment, judge_player1_reason, judge_player2_reason',
+      )
       .eq('game_id', gameId)
       .eq('round_number', game.current_round_number)
       .order('created_at', { ascending: false })
@@ -168,6 +186,16 @@ export async function fetchRoomSnapshot(gameId: string): Promise<RoomSnapshot> {
     phase: toPhase(game, round),
     players: toRemotePlayers(playerRows ?? [], submissions ?? []),
     winnerPlayerId: round?.winner_player_id ?? null,
+    judgeSummary:
+      round && round.judge_player1_score != null && round.judge_player2_score != null
+        ? {
+            player1Score: round.judge_player1_score,
+            player2Score: round.judge_player2_score,
+            comment: round.judge_comment ?? '',
+            player1Reason: round.judge_player1_reason,
+            player2Reason: round.judge_player2_reason,
+          }
+        : null,
   };
 }
 

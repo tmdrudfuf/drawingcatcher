@@ -7,72 +7,130 @@ import { RemoteDrawing } from '@/components/game/RemoteDrawing';
 import { Card } from '@/components/ui/Card';
 import { Screen } from '@/components/ui/Screen';
 import { useGame } from '@/providers/game/GameProvider';
-import { judgeService, type JudgeRoundResult } from '@/services/ai/judge';
+import { fakeJudgeService, judgeService, type JudgeRoundInput, type JudgeRoundResult } from '@/services/ai/judge';
 import { track } from '@/services/analytics/analytics';
 import { resolveDrawingUri } from '@/services/drawing/drawingAssets';
 import { colors } from '@/theme';
 
+// Mirrors RevealScreen's CHARACTERIZE_TIMEOUT_MS reasoning: comfortably above
+// the judge-round Edge Function's own worst case (~25s Gemini timeout, or a
+// waiting caller's own ~20s poll budget), so a slow-but-alive call still gets
+// relayed back instead of the client giving up first. Duplicated here rather
+// than shared/exported from RevealScreen.tsx, which is out of scope to touch.
+const JUDGE_TIMEOUT_MS = 30_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * Judging that always resolves. Routes to Gemini when `input.context` is
+ * present (remote game) via the shared `judgeService` router, or the local
+ * fake provider otherwise. On timeout/error (Gemini down, edge function
+ * unreachable, malformed result) it falls back to the fake judge's result so
+ * the round can still complete — real AI failure must never be the only path
+ * to a result.
+ */
+async function judgeSafely(
+  input: JudgeRoundInput,
+  provider: 'gemini' | 'fake',
+): Promise<{ result: JudgeRoundResult; usedFallback: boolean }> {
+  try {
+    const result = await withTimeout(judgeService.judgeRound(input), JUDGE_TIMEOUT_MS);
+    return { result, usedFallback: false };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'unknown';
+    if (__DEV__) console.log('[judge] failed, falling back to fake', reason);
+    track('judge_failed', { provider, reason });
+    track('judge_fallback_used', { reason });
+    const result = await fakeJudgeService.judgeRound(input);
+    return { result, usedFallback: true };
+  }
+}
+
 export function JudgeScreen() {
-  const { state, isRemoteGame, localPlayerId, localDrawingUri, completeRemoteJudging, reportJudgeResult } = useGame();
+  const {
+    state,
+    remoteRoom,
+    isRemoteGame,
+    localPlayerId,
+    localDrawingUri,
+    completeRemoteJudging,
+    reportJudgeResult,
+  } = useGame();
   const [cues, setCues] = useState<string[]>([]);
   const [shown, setShown] = useState(0);
+  const [cuesDone, setCuesDone] = useState(false);
   const resultRef = useRef<JudgeRoundResult | null>(null);
   const doneRef = useRef(false);
+  const startedRef = useRef(false);
+
+  useEffect(() => {
+    if (remoteRoom?.status === 'ended') router.replace('/');
+  }, [remoteRoom?.status]);
 
   useEffect(() => {
     if (state.roundNumber === 0) {
       router.replace('/');
       return;
     }
-
-    if (isRemoteGame) {
-      const result: JudgeRoundResult = {
-        players: [
-          {
-            playerId: state.players[0].id,
-            score: 87,
-            recognized: true,
-            observations: ['cat detected', 'tiny legs', 'raised curved tail'],
-          },
-          {
-            playerId: state.players[1].id,
-            score: 74,
-            recognized: true,
-            observations: ['cat detected', 'unusually long legs', 'surprised face'],
-          },
-        ],
-        winnerPlayerId: state.players[0].id,
-        comment: 'Those tiny legs somehow made the cat more powerful.',
-        suspenseCues: [
-          'CAT DETECTED',
-          'TINY LEGS DETECTED...',
-          'ANATOMY: QUESTIONABLE',
-          'ARTISTIC CONFIDENCE: SOMEHOW HIGH',
-        ],
-      };
-      resultRef.current = result;
-      const t = setTimeout(() => setCues(result.suspenseCues), 0);
-      return () => clearTimeout(t);
-    }
+    // One-shot, deliberately: re-running this on every remoteRoom/state
+    // object churn was the exact bug fixed in RevealScreen (GameProvider
+    // hands out new object references on every realtime tick). JudgeScreen
+    // only reaches here once a round genuinely exists, so there's nothing to
+    // legitimately wait for the way Reveal had to wait for `winner`.
+    if (startedRef.current) return;
+    startedRef.current = true;
 
     let cancelled = false;
-    track('judge_started');
-    judgeService
-      .judgeRound({ prompt: state.prompt, drawings: state.players.map((p) => p.drawing) })
-      .then((res) => {
-        if (!cancelled) {
-          resultRef.current = res;
-          setCues(res.suspenseCues);
+    const provider: 'gemini' | 'fake' = isRemoteGame ? 'gemini' : 'fake';
+    track('judge_started', { round: state.roundNumber, provider });
+
+    const context =
+      isRemoteGame && remoteRoom?.currentRoundId
+        ? { gameId: remoteRoom.gameId, roundId: remoteRoom.currentRoundId }
+        : undefined;
+
+    judgeSafely({ prompt: state.prompt, drawings: state.players.map((p) => p.drawing), context }, provider).then(
+      ({ result, usedFallback }) => {
+        if (cancelled) return;
+        resultRef.current = result;
+        setCues(result.suspenseCues);
+        track('judge_completed', { round: state.roundNumber, provider, usedFallback });
+
+        if (isRemoteGame && usedFallback) {
+          // Real judging failed or timed out. The Edge Function does NOT
+          // advance rounds.status on failure (only on success), so this
+          // client-side call is what makes the round progress instead of
+          // both devices getting stuck on this screen. Idempotent — a
+          // concurrent duplicate call from the other device is a no-op (the
+          // RPC is guarded on rounds.status = 'judging').
+          completeRemoteJudging();
         }
-      });
+      },
+    );
+
     return () => {
       cancelled = true;
     };
-  }, [isRemoteGame, state.roundNumber, state.prompt, state.players]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.roundNumber]);
 
   useEffect(() => {
-    if (isRemoteGame && state.phase === 'results') router.replace('/results');
-  }, [isRemoteGame, state.phase]);
+    if (isRemoteGame && cuesDone && state.phase === 'results') router.replace('/results');
+  }, [isRemoteGame, cuesDone, state.phase]);
 
   useEffect(() => {
     if (cues.length === 0) return;
@@ -83,15 +141,20 @@ export function JudgeScreen() {
     const t = setTimeout(() => {
       if (doneRef.current || !resultRef.current) return;
       doneRef.current = true;
-      if (isRemoteGame) {
-        completeRemoteJudging();
-      } else {
+      setCuesDone(true);
+      if (!isRemoteGame) {
         reportJudgeResult(resultRef.current);
         router.replace('/results');
       }
+      // Remote: nothing left to do here. Success already advanced
+      // rounds.status server-side (inside judgeSafely, above); failure
+      // advanced it via completeRemoteJudging(). The cuesDone effect above
+      // now takes over once realtime delivers that phase change — this just
+      // makes sure the suspense animation always finishes locally first,
+      // regardless of which order those two things happen in.
     }, 900);
     return () => clearTimeout(t);
-  }, [completeRemoteJudging, cues, isRemoteGame, reportJudgeResult, shown]);
+  }, [cues, isRemoteGame, reportJudgeResult, shown]);
 
   const calculating = cues.length > 0 && shown >= cues.length;
 
