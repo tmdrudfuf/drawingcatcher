@@ -14,7 +14,9 @@
 //
 // GEMINI_API_KEY lives only here (a Supabase Edge Function secret) and is
 // never returned to the client or logged. SUPABASE_URL /
-// SUPABASE_SERVICE_ROLE_KEY are injected automatically by the platform.
+// SUPABASE_SECRET_KEYS are injected automatically by the platform.
+// JUDGE_SUPABASE_SECRET_KEY_NAME explicitly selects the intended named secret
+// from that JSON map; the legacy service-role key is never used.
 //
 // CONCURRENCY: both devices can call this for the same round at nearly the
 // same instant. Judging is claimed via a single conditional UPDATE on
@@ -82,6 +84,56 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
   });
+}
+
+/**
+ * Resolves one explicitly named Supabase secret API key from the runtime's
+ * JSON map. The map may contain multiple independently rotatable keys, so
+ * choosing the first entry or assuming a conventional name would be unsafe.
+ * Never include the map, selected value, or supplied name in an error/log.
+ */
+function resolveSupabaseSecretKey(): string {
+  const keyName = Deno.env.get('JUDGE_SUPABASE_SECRET_KEY_NAME')?.trim();
+  if (!keyName) {
+    throw new StructuredError(
+      'server_misconfigured',
+      'JUDGE_SUPABASE_SECRET_KEY_NAME is not configured for judging.',
+      500,
+    );
+  }
+
+  const rawSecretKeys = Deno.env.get('SUPABASE_SECRET_KEYS');
+  if (!rawSecretKeys) {
+    throw new StructuredError('server_misconfigured', 'SUPABASE_SECRET_KEYS is unavailable.', 500);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawSecretKeys);
+  } catch {
+    throw new StructuredError('server_misconfigured', 'SUPABASE_SECRET_KEYS is not valid JSON.', 500);
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new StructuredError('server_misconfigured', 'SUPABASE_SECRET_KEYS has an invalid structure.', 500);
+  }
+
+  const secretKeys = parsed as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(secretKeys, keyName)) {
+    throw new StructuredError('server_misconfigured', 'The configured Supabase secret key name was not found.', 500);
+  }
+
+  const selectedKey = secretKeys[keyName];
+  if (
+    typeof selectedKey !== 'string' ||
+    selectedKey !== selectedKey.trim() ||
+    !selectedKey.startsWith('sb_secret_') ||
+    selectedKey.length <= 'sb_secret_'.length
+  ) {
+    throw new StructuredError('server_misconfigured', 'The configured Supabase secret credential is invalid.', 500);
+  }
+
+  return selectedKey;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -301,7 +353,19 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: 'server_misconfigured', message: 'Judging is not configured.' }, 500);
   }
 
-  const admin = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+  let supabaseSecretKey: string;
+  try {
+    supabaseSecretKey = resolveSupabaseSecretKey();
+  } catch (err) {
+    const structured =
+      err instanceof StructuredError
+        ? err
+        : new StructuredError('server_misconfigured', 'The Supabase admin credential could not be resolved.', 500);
+    console.error('[judge-round] Supabase admin credential is not configured');
+    return jsonResponse({ error: structured.code, message: structured.message }, structured.status);
+  }
+
+  const admin = createClient(Deno.env.get('SUPABASE_URL')!, supabaseSecretKey);
 
   console.log('[judge-round] started', { gameId, roundId });
 
