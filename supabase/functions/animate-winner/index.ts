@@ -224,6 +224,72 @@ async function verifyWinnerSubmission(
   return { roundSubmissionId: submission.id };
 }
 
+interface AnimationJobRow {
+  id: string;
+  status: string;
+  entitlement_source: string | null;
+  paid_generation_requested_at: string | null;
+}
+
+/** Only the fields safe to return to a client: no storage paths, operation names, or raw rows. */
+function jobResponsePayload(roundSubmissionId: string, job: AnimationJobRow): Record<string, unknown> {
+  return {
+    verified: true,
+    jobId: job.id,
+    jobStatus: job.status,
+    roundSubmissionId,
+    entitlementSource: job.entitlement_source,
+    paidGenerationRequested: job.paid_generation_requested_at !== null,
+  };
+}
+
+/** Fast, non-atomic reuse check — mirrors characterize-drawing's "already done" fast path. */
+async function findExistingAnimationJob(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  roundSubmissionId: string,
+): Promise<AnimationJobRow | null> {
+  const { data, error } = await admin
+    .from('animation_jobs')
+    .select('id, status, entitlement_source, paid_generation_requested_at')
+    .eq('round_submission_id', roundSubmissionId)
+    .maybeSingle();
+  if (error) throw new StructuredError('db_error', error.message, 500);
+  return data;
+}
+
+/**
+ * Atomically reuses an existing job or reserves one entitlement and creates
+ * exactly one job, via the claim_animation_job RPC (see the M4C step-4
+ * migration for the transaction/concurrency behavior). Never sets
+ * paid_generation_requested_at and never calls Veo.
+ */
+async function claimAnimationJob(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  gameId: string,
+  roundId: string,
+  playerId: string,
+  roundSubmissionId: string,
+): Promise<AnimationJobRow> {
+  const { data, error } = await admin.rpc('claim_animation_job', {
+    p_game_id: gameId,
+    p_round_id: roundId,
+    p_player_id: playerId,
+    p_round_submission_id: roundSubmissionId,
+  });
+  if (error) throw new StructuredError('db_error', error.message, 500);
+  const job: AnimationJobRow | undefined = Array.isArray(data) ? data[0] : data;
+  if (!job) {
+    throw new StructuredError(
+      'entitlement_required',
+      'No available animation entitlement for this player.',
+      402,
+    );
+  }
+  return job;
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return jsonResponse({ ok: true });
   if (req.method !== 'POST') {
@@ -274,26 +340,30 @@ Deno.serve(async (req) => {
         request.playerId,
       );
       console.log('[animate-winner] start_verified');
-      return jsonResponse(
-        {
-          verified: true,
-          gameId: request.gameId,
-          roundId: request.roundId,
-          playerId: request.playerId,
-          roundSubmissionId,
-          characterizationReady: true,
-          error: 'NOT_IMPLEMENTED',
-        },
-        501,
+
+      const existingJob = await findExistingAnimationJob(admin, roundSubmissionId);
+      if (existingJob) {
+        console.log('[animate-winner] start_job_reused');
+        return jsonResponse(jobResponsePayload(roundSubmissionId, existingJob), 200);
+      }
+
+      const claimedJob = await claimAnimationJob(
+        admin,
+        request.gameId,
+        request.roundId,
+        request.playerId,
+        roundSubmissionId,
       );
+      console.log('[animate-winner] start_job_claimed');
+      return jsonResponse(jobResponsePayload(roundSubmissionId, claimedJob), 200);
     } catch (error) {
       const structured = error instanceof StructuredError
         ? error
-        : new StructuredError('unexpected_error', 'Verification failed unexpectedly.', 500);
+        : new StructuredError('unexpected_error', 'Start failed unexpectedly.', 500);
       if (!(error instanceof StructuredError)) {
-        console.error('[animate-winner] start verification failed unexpectedly');
+        console.error('[animate-winner] start failed unexpectedly');
       }
-      console.log('[animate-winner] start_verification_failed', { code: structured.code });
+      console.log('[animate-winner] start_failed', { code: structured.code });
       return jsonResponse({ error: structured.code, message: structured.message }, structured.status);
     }
   }
