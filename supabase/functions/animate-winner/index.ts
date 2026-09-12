@@ -154,6 +154,76 @@ function notImplemented(action: AnimateWinnerRequest['action']): Response {
   );
 }
 
+/**
+ * Verifies a 'start' request against authoritative server-side data before any
+ * future paid animation work is allowed. playerId is only an input to compare
+ * against the round's real winner_player_id — it is never trusted as
+ * authorization by itself.
+ *
+ * round_submissions has no game_id column, so the game/round match is proven
+ * by chaining: rounds.id = roundId AND rounds.game_id = gameId (checked
+ * first), then round_submissions.round_id = roundId. There is no separate
+ * "is winner" flag on a submission — the winning submission is simply the
+ * (roundId, playerId) submission once rounds.winner_player_id is confirmed
+ * to equal playerId.
+ */
+async function verifyWinnerSubmission(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  gameId: string,
+  roundId: string,
+  playerId: string,
+): Promise<{ roundSubmissionId: string }> {
+  const { data: game, error: gameError } = await admin
+    .from('games')
+    .select('id')
+    .eq('id', gameId)
+    .maybeSingle();
+  if (gameError) throw new StructuredError('db_error', gameError.message, 500);
+  if (!game) throw new StructuredError('game_not_found', 'No such game.', 404);
+
+  const { data: round, error: roundError } = await admin
+    .from('rounds')
+    .select('id, game_id, winner_player_id')
+    .eq('id', roundId)
+    .maybeSingle();
+  if (roundError) throw new StructuredError('db_error', roundError.message, 500);
+  if (!round) throw new StructuredError('round_not_found', 'No such round.', 404);
+  if (round.game_id !== gameId) {
+    throw new StructuredError('round_game_mismatch', 'The round does not belong to that game.', 409);
+  }
+  if (!round.winner_player_id) {
+    throw new StructuredError('winner_not_ready', 'This round has not produced a winner yet.', 409);
+  }
+  if (round.winner_player_id !== playerId) {
+    throw new StructuredError('not_winner', 'That player did not win this round.', 403);
+  }
+
+  const { data: submission, error: subError } = await admin
+    .from('round_submissions')
+    .select('id, characterization_status, characterized_path')
+    .eq('round_id', roundId)
+    .eq('player_id', playerId)
+    .maybeSingle();
+  if (subError) throw new StructuredError('db_error', subError.message, 500);
+  if (!submission) {
+    throw new StructuredError('submission_not_found', 'No winning submission found for that round.', 404);
+  }
+
+  if (submission.characterization_status !== 'completed') {
+    throw new StructuredError('characterization_not_ready', 'Characterization has not completed yet.', 409);
+  }
+  if (!submission.characterized_path) {
+    throw new StructuredError(
+      'characterized_asset_missing',
+      'Characterization completed without a stored asset.',
+      500,
+    );
+  }
+
+  return { roundSubmissionId: submission.id };
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return jsonResponse({ ok: true });
   if (req.method !== 'POST') {
@@ -179,9 +249,10 @@ Deno.serve(async (req) => {
   }
 
   let supabaseSecretKey: string;
+  let admin: ReturnType<typeof createAdminClient>;
   try {
     supabaseSecretKey = resolveSupabaseSecretKey();
-    createAdminClient(supabaseSecretKey);
+    admin = createAdminClient(supabaseSecretKey);
   } catch (error) {
     const structured = error instanceof StructuredError
       ? error
@@ -192,6 +263,39 @@ Deno.serve(async (req) => {
 
   if (request.action === 'sweep' && !isSecretKeyRequest(req, supabaseSecretKey)) {
     return jsonResponse({ error: 'forbidden', message: 'sweep requires secret-key authorization.' }, 403);
+  }
+
+  if (request.action === 'start') {
+    try {
+      const { roundSubmissionId } = await verifyWinnerSubmission(
+        admin,
+        request.gameId,
+        request.roundId,
+        request.playerId,
+      );
+      console.log('[animate-winner] start_verified');
+      return jsonResponse(
+        {
+          verified: true,
+          gameId: request.gameId,
+          roundId: request.roundId,
+          playerId: request.playerId,
+          roundSubmissionId,
+          characterizationReady: true,
+          error: 'NOT_IMPLEMENTED',
+        },
+        501,
+      );
+    } catch (error) {
+      const structured = error instanceof StructuredError
+        ? error
+        : new StructuredError('unexpected_error', 'Verification failed unexpectedly.', 500);
+      if (!(error instanceof StructuredError)) {
+        console.error('[animate-winner] start verification failed unexpectedly');
+      }
+      console.log('[animate-winner] start_verification_failed', { code: structured.code });
+      return jsonResponse({ error: structured.code, message: structured.message }, structured.status);
+    }
   }
 
   return notImplemented(request.action);
