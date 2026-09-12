@@ -246,14 +246,13 @@ async function startProbe(body: ProbeBody, geminiKey: string, supabaseSecretKey:
     instances: [
       {
         prompt: PROBE_PROMPT,
-        image: { inlineData: { mimeType: 'image/png', data: imageBase64 } },
+        image: { bytesBase64Encoded: imageBase64, mimeType: 'image/png' },
       },
     ],
     parameters: {
       aspectRatio: '9:16',
-      durationSeconds: '4',
+      durationSeconds: 4,
       resolution: '720p',
-      numberOfVideos: 1,
       personGeneration: 'allow_adult',
     },
   };
@@ -288,12 +287,19 @@ async function startProbe(body: ProbeBody, geminiKey: string, supabaseSecretKey:
 
   const payload = await parseJsonResponse(generationResponse);
   if (!generationResponse.ok) {
+    const providerError = providerErrorSummary(payload, `Veo returned HTTP ${generationResponse.status}.`);
+    console.error('[veo-api-probe] generation_provider_error', {
+      generationHttpStatus: generationResponse.status,
+      providerErrorCode: providerError.code,
+      providerErrorStatus: providerError.status,
+      providerErrorMessage: providerError.message,
+    });
     return jsonResponse(
       {
         accepted: false,
         model: VEO_MODEL,
         generationHttpStatus: generationResponse.status,
-        providerError: providerErrorSummary(payload, `Veo returned HTTP ${generationResponse.status}.`),
+        providerError,
         responseShape: describeShape(payload),
         automaticRetryPerformed: false,
       },
@@ -326,7 +332,12 @@ async function startProbe(body: ProbeBody, geminiKey: string, supabaseSecretKey:
     operationName,
     operationResponseShape: describeShape(payload),
     requestSummary: {
-      instances: [{ prompt: '<fixed preservation-first prompt>', image: { inlineData: { mimeType: 'image/png', data: '<redacted>' } } }],
+      instances: [
+        {
+          prompt: '<fixed preservation-first prompt>',
+          image: { bytesBase64Encoded: '<redacted>', mimeType: 'image/png' },
+        },
+      ],
       parameters: requestBody.parameters,
     },
     paidGenerationRequestsThisInvocation: 1,
