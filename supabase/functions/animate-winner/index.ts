@@ -1,10 +1,28 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
+import { encodeBase64 } from 'https://deno.land/std@0.224.0/encoding/base64.ts';
 
+const CHARACTERIZED_BUCKET = 'characterized';
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+const VEO_MODEL = 'veo-3.1-generate-preview';
+const VEO_CREATE_TIMEOUT_MS = 30_000;
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 const MAX_SWEEP_LIMIT = 100;
+
+const ANIMATION_PROMPT = `Animate this exact character with one small playful, funny motion.
+
+Preserve the character's identity, silhouette, unusual proportions, colors,
+asymmetry, facial features, limb count, and every recognizable weird detail.
+
+Do not redesign, beautify, normalize, replace, or reinterpret the character.
+Keep the composition and background simple and stable. Use only one small
+movement such as a wobble, waddle, bounce, blink, tail wag, stumble, or
+surprised reaction.
+
+No cuts. No dramatic camera movement. No new characters. No extra limbs.
+No text.`;
 
 type AnimateWinnerRequest =
   | {
@@ -34,8 +52,36 @@ class StructuredError extends Error {
   }
 }
 
-function jsonResponse(body: Record<string, unknown>, status = 200): Response {
-  return new Response(JSON.stringify({ ...body, paidGenerationRequestsThisInvocation: 0 }), {
+interface ProviderErrorSummary {
+  code: number | string | null;
+  status: string | null;
+  message: string;
+}
+
+type VeoCreateResult =
+  | {
+      outcome: 'accepted';
+      httpStatus: 200;
+      operationName: string;
+    }
+  | {
+      outcome: 'rejected';
+      httpStatus: number;
+      providerError: ProviderErrorSummary;
+    }
+  | {
+      outcome: 'ambiguous';
+      httpStatus: number | null;
+      errorCode: string;
+      message: string;
+    };
+
+function jsonResponse(
+  body: Record<string, unknown>,
+  status = 200,
+  paidGenerationRequestsThisInvocation = 0,
+): Response {
+  return new Response(JSON.stringify({ ...body, paidGenerationRequestsThisInvocation }), {
     status,
     headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
   });
@@ -100,6 +146,143 @@ function safeEqual(left: string, right: string): boolean {
 function isSecretKeyRequest(req: Request, secretKey: string): boolean {
   const apiKey = req.headers.get('apikey') ?? '';
   return Boolean(apiKey && safeEqual(apiKey, secretKey));
+}
+
+function providerErrorSummary(value: unknown, fallback: string): ProviderErrorSummary {
+  const candidate =
+    value && typeof value === 'object' && 'error' in value
+      ? (value as { error?: unknown }).error
+      : value;
+  if (!candidate || typeof candidate !== 'object') {
+    return { code: null, status: null, message: fallback };
+  }
+  const error = candidate as Record<string, unknown>;
+  return {
+    code: typeof error.code === 'number' || typeof error.code === 'string' ? error.code : null,
+    status: typeof error.status === 'string' ? error.status.slice(0, 200) : null,
+    message: typeof error.message === 'string' ? error.message.slice(0, 1000) : fallback,
+  };
+}
+
+function isSafeOperationName(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 500 &&
+    value.includes('operations/') &&
+    !value.includes('..') &&
+    !value.includes('://') &&
+    !/[?#\\]/.test(value) &&
+    /^[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$/.test(value)
+  );
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function parseProviderJson(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function createVeoAnimation(
+  apiKey: string,
+  prompt: string,
+  imageBase64: string,
+): Promise<VeoCreateResult> {
+  const endpoint = `${GEMINI_BASE_URL}/models/${VEO_MODEL}:predictLongRunning`;
+  const requestBody = {
+    instances: [
+      {
+        prompt,
+        image: { bytesBase64Encoded: imageBase64, mimeType: 'image/png' },
+      },
+    ],
+    parameters: {
+      aspectRatio: '9:16',
+      durationSeconds: 4,
+      resolution: '720p',
+      personGeneration: 'allow_adult',
+    },
+  };
+
+  let response: Response;
+  try {
+    // This is the only paid create request. Raw fetch performs no retry, and
+    // no catch/fallback path calls this endpoint again.
+    response = await fetchWithTimeout(
+      endpoint,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify(requestBody),
+      },
+      VEO_CREATE_TIMEOUT_MS,
+    );
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === 'AbortError';
+    return {
+      outcome: 'ambiguous',
+      httpStatus: null,
+      errorCode: timedOut ? 'veo_create_timeout_ambiguous' : 'veo_create_transport_ambiguous',
+      message: timedOut
+        ? 'The Veo creation response timed out; acceptance is unknown and the request must not be retried.'
+        : 'The Veo creation transport failed after dispatch; acceptance is unknown and the request must not be retried.',
+    };
+  }
+
+  let payload: unknown;
+  try {
+    payload = await parseProviderJson(response);
+  } catch {
+    return {
+      outcome: 'ambiguous',
+      httpStatus: response.status,
+      errorCode: 'veo_response_read_ambiguous',
+      message: 'The Veo creation response could not be read; acceptance is unknown and the request must not be retried.',
+    };
+  }
+  if (response.status === 408 || response.status >= 500) {
+    return {
+      outcome: 'ambiguous',
+      httpStatus: response.status,
+      errorCode: 'veo_create_http_ambiguous',
+      message: `Veo returned HTTP ${response.status}; acceptance is uncertain and the request must not be retried.`,
+    };
+  }
+  if (response.status !== 200) {
+    return {
+      outcome: 'rejected',
+      httpStatus: response.status,
+      providerError: providerErrorSummary(payload, `Veo returned HTTP ${response.status}.`),
+    };
+  }
+
+  const operationName =
+    payload && typeof payload === 'object' && typeof (payload as Record<string, unknown>).name === 'string'
+      ? ((payload as Record<string, unknown>).name as string)
+      : null;
+  if (!operationName || !isSafeOperationName(operationName)) {
+    return {
+      outcome: 'ambiguous',
+      httpStatus: response.status,
+      errorCode: 'veo_operation_name_missing',
+      message: 'Veo returned HTTP 200 without a safe operation name; the request must not be retried.',
+    };
+  }
+
+  return { outcome: 'accepted', httpStatus: 200, operationName };
 }
 
 function requiredString(body: Record<string, unknown>, field: string): string {
@@ -205,7 +388,7 @@ async function verifyWinnerSubmission(
   gameId: string,
   roundId: string,
   playerId: string,
-): Promise<{ roundSubmissionId: string }> {
+): Promise<{ roundSubmissionId: string; characterizedPath: string }> {
   const { data: game, error: gameError } = await admin
     .from('games')
     .select('id')
@@ -253,7 +436,7 @@ async function verifyWinnerSubmission(
     );
   }
 
-  return { roundSubmissionId: submission.id };
+  return { roundSubmissionId: submission.id, characterizedPath: submission.characterized_path };
 }
 
 interface AnimationJobRow {
@@ -322,6 +505,110 @@ async function claimAnimationJob(
   return job;
 }
 
+async function findAnimationJobById(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  jobId: string,
+): Promise<AnimationJobRow> {
+  const { data, error } = await admin
+    .from('animation_jobs')
+    .select('id, status, entitlement_source, paid_generation_requested_at')
+    .eq('id', jobId)
+    .maybeSingle();
+  if (error) throw new StructuredError('db_error', error.message, 500);
+  if (!data) throw new StructuredError('animation_job_not_found', 'Animation job no longer exists.', 404);
+  return data;
+}
+
+async function claimPaidGenerationRequest(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  jobId: string,
+): Promise<AnimationJobRow | null> {
+  const { data, error } = await admin.rpc('claim_paid_generation_request', { p_job_id: jobId });
+  if (error) {
+    if (error.code === 'P0001' && error.message.includes('paid_generation_already_requested')) {
+      return null;
+    }
+    if (error.code === 'P0002' && error.message.includes('animation_job_not_found')) {
+      throw new StructuredError('animation_job_not_found', 'Animation job no longer exists.', 404);
+    }
+    throw new StructuredError('db_error', error.message, 500);
+  }
+  const job: AnimationJobRow | undefined = Array.isArray(data) ? data[0] : data;
+  if (!job?.paid_generation_requested_at) {
+    throw new StructuredError('db_error', 'Paid-generation claim returned an invalid job.', 500);
+  }
+  return job;
+}
+
+function hasPngSignature(bytes: Uint8Array): boolean {
+  const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  return bytes.length >= signature.length && signature.every((value, index) => bytes[index] === value);
+}
+
+async function loadCharacterizedPng(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  characterizedPath: string,
+): Promise<string> {
+  const { data: imageBlob, error } = await admin.storage.from(CHARACTERIZED_BUCKET).download(characterizedPath);
+  if (error || !imageBlob) {
+    throw new StructuredError(
+      'source_image_download_failed',
+      'The characterized source image could not be downloaded after the paid claim.',
+      502,
+    );
+  }
+  if (imageBlob.type && imageBlob.type !== 'image/png' && imageBlob.type !== 'application/octet-stream') {
+    throw new StructuredError(
+      'source_image_invalid_type',
+      'The characterized source image is not a PNG.',
+      422,
+    );
+  }
+
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(await imageBlob.arrayBuffer());
+  } catch {
+    throw new StructuredError(
+      'source_image_read_failed',
+      'The characterized source image could not be read after the paid claim.',
+      502,
+    );
+  }
+  if (!bytes.length) {
+    throw new StructuredError('source_image_empty', 'The characterized source image is empty.', 422);
+  }
+  if (!hasPngSignature(bytes)) {
+    throw new StructuredError(
+      'source_image_invalid_png',
+      'The characterized source image does not contain valid PNG bytes.',
+      422,
+    );
+  }
+  return encodeBase64(bytes);
+}
+
+async function updateAnimationJob(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  jobId: string,
+  updates: Record<string, unknown>,
+): Promise<AnimationJobRow> {
+  const { data, error } = await admin
+    .from('animation_jobs')
+    .update(updates)
+    .eq('id', jobId)
+    .select('id, status, entitlement_source, paid_generation_requested_at')
+    .single();
+  if (error || !data) {
+    throw new StructuredError('db_error', 'Animation job state could not be persisted.', 500);
+  }
+  return data;
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return jsonResponse({ ok: true });
   if (req.method !== 'POST') {
@@ -368,7 +655,7 @@ Deno.serve(async (req) => {
       await verifyPlayerOwnership(admin, request.playerId, request.playerSecret);
       console.log('[animate-winner] start_authorized');
 
-      const { roundSubmissionId } = await verifyWinnerSubmission(
+      const { roundSubmissionId, characterizedPath } = await verifyWinnerSubmission(
         admin,
         request.gameId,
         request.roundId,
@@ -376,21 +663,181 @@ Deno.serve(async (req) => {
       );
       console.log('[animate-winner] start_verified');
 
-      const existingJob = await findExistingAnimationJob(admin, roundSubmissionId);
-      if (existingJob) {
+      let job = await findExistingAnimationJob(admin, roundSubmissionId);
+      if (job?.paid_generation_requested_at) {
         console.log('[animate-winner] start_job_reused');
-        return jsonResponse(jobResponsePayload(roundSubmissionId, existingJob), 200);
+        return jsonResponse(jobResponsePayload(roundSubmissionId, job), 200);
       }
 
-      const claimedJob = await claimAnimationJob(
-        admin,
-        request.gameId,
-        request.roundId,
-        request.playerId,
-        roundSubmissionId,
-      );
-      console.log('[animate-winner] start_job_claimed');
-      return jsonResponse(jobResponsePayload(roundSubmissionId, claimedJob), 200);
+      if (!job) {
+        job = await claimAnimationJob(
+          admin,
+          request.gameId,
+          request.roundId,
+          request.playerId,
+          roundSubmissionId,
+        );
+        console.log('[animate-winner] start_job_claimed');
+      }
+
+      if (job.paid_generation_requested_at || job.status !== 'starting') {
+        console.log('[animate-winner] start_job_reused');
+        return jsonResponse(jobResponsePayload(roundSubmissionId, job), 200);
+      }
+
+      const veoApiKey = Deno.env.get('GEMINI_API_KEY')?.trim();
+      if (!veoApiKey) {
+        console.error('[animate-winner] Veo API credential is not configured');
+        throw new StructuredError('server_misconfigured', 'Winner animation is not configured.', 500);
+      }
+
+      const paidClaimedJob = await claimPaidGenerationRequest(admin, job.id);
+      if (!paidClaimedJob) {
+        const reusedJob = await findAnimationJobById(admin, job.id);
+        console.log('[animate-winner] start_paid_claim_reused');
+        return jsonResponse(jobResponsePayload(roundSubmissionId, reusedJob), 200);
+      }
+      job = paidClaimedJob;
+      console.log('[animate-winner] start_paid_claimed');
+
+      let imageBase64: string;
+      try {
+        imageBase64 = await loadCharacterizedPng(admin, characterizedPath);
+      } catch (error) {
+        const structured = error instanceof StructuredError
+          ? error
+          : new StructuredError(
+            'source_image_read_failed',
+            'The characterized source image could not be prepared after the paid claim.',
+            502,
+          );
+        const failedJob = await updateAnimationJob(admin, job.id, {
+          status: 'failed',
+          provider: 'veo',
+          provider_model: VEO_MODEL,
+          provider_error_code: null,
+          provider_error_status: null,
+          error_code: structured.code,
+          error_message: structured.message,
+          failed_at: new Date().toISOString(),
+        });
+        console.log('[animate-winner] start_source_failed', { code: structured.code });
+        return jsonResponse(
+          {
+            ...jobResponsePayload(roundSubmissionId, failedJob),
+            error: structured.code,
+            message: structured.message,
+            automaticRetryAllowed: false,
+          },
+          structured.status,
+        );
+      }
+
+      // Exactly one call site exists for the one-shot paid Veo create helper.
+      // Reaching it requires this invocation's successful atomic DB claim.
+      const createResult = await createVeoAnimation(veoApiKey, ANIMATION_PROMPT, imageBase64);
+
+      try {
+        if (createResult.outcome === 'accepted') {
+          const pendingJob = await updateAnimationJob(admin, job.id, {
+            status: 'operation_pending',
+            provider: 'veo',
+            provider_model: VEO_MODEL,
+            veo_operation_name: createResult.operationName,
+            provider_error_code: null,
+            provider_error_status: null,
+            error_code: null,
+            error_message: null,
+            failed_at: null,
+          });
+          console.log('[animate-winner] start_provider_accepted', {
+            providerHttpStatus: createResult.httpStatus,
+          });
+          return jsonResponse(
+            {
+              ...jobResponsePayload(roundSubmissionId, pendingJob),
+              providerAccepted: true,
+              providerHttpStatus: createResult.httpStatus,
+            },
+            200,
+            1,
+          );
+        }
+
+        if (createResult.outcome === 'rejected') {
+          const failedJob = await updateAnimationJob(admin, job.id, {
+            status: 'failed',
+            provider: 'veo',
+            provider_model: VEO_MODEL,
+            provider_error_code: createResult.providerError.code === null
+              ? null
+              : String(createResult.providerError.code).slice(0, 200),
+            provider_error_status: createResult.providerError.status,
+            error_code: 'veo_create_rejected',
+            error_message: createResult.providerError.message,
+            failed_at: new Date().toISOString(),
+          });
+          console.log('[animate-winner] start_provider_rejected', {
+            providerHttpStatus: createResult.httpStatus,
+            providerErrorCode: createResult.providerError.code,
+            providerErrorStatus: createResult.providerError.status,
+          });
+          return jsonResponse(
+            {
+              ...jobResponsePayload(roundSubmissionId, failedJob),
+              error: 'veo_create_rejected',
+              message: createResult.providerError.message,
+              providerAccepted: false,
+              providerHttpStatus: createResult.httpStatus,
+              automaticRetryAllowed: false,
+            },
+            502,
+            1,
+          );
+        }
+
+        const ambiguousJob = await updateAnimationJob(admin, job.id, {
+          status: 'ambiguous',
+          provider: 'veo',
+          provider_model: VEO_MODEL,
+          provider_error_code: null,
+          provider_error_status: null,
+          error_code: createResult.errorCode,
+          error_message: createResult.message,
+          failed_at: null,
+        });
+        console.log('[animate-winner] start_provider_ambiguous', {
+          providerHttpStatus: createResult.httpStatus,
+          code: createResult.errorCode,
+        });
+        return jsonResponse(
+          {
+            ...jobResponsePayload(roundSubmissionId, ambiguousJob),
+            error: createResult.errorCode,
+            message: createResult.message,
+            providerAccepted: null,
+            providerHttpStatus: createResult.httpStatus,
+            automaticRetryAllowed: false,
+          },
+          502,
+          1,
+        );
+      } catch (error) {
+        console.error('[animate-winner] provider result persistence failed');
+        const structured = error instanceof StructuredError
+          ? error
+          : new StructuredError('db_error', 'The provider result could not be persisted.', 500);
+        return jsonResponse(
+          {
+            error: structured.code,
+            message: `${structured.message} The paid marker remains set; do not retry start.`,
+            jobId: job.id,
+            automaticRetryAllowed: false,
+          },
+          structured.status,
+          1,
+        );
+      }
     } catch (error) {
       const structured = error instanceof StructuredError
         ? error
