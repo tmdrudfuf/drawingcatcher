@@ -6,7 +6,7 @@ import type { CharacterizationResult } from '@/services/ai/characterization';
 import type { AnimationJobState, MotionName } from '@/services/ai/animation';
 import type { JudgeRoundResult } from '@/services/ai/judge';
 import { buildRound, FAKE_PLAYERS } from '@/services/game/fakeData';
-import { getGuestIdentity, type GuestIdentity } from '@/services/game/guestIdentity';
+import { getGuestIdentity, rotateGuestIdentity, type GuestIdentity } from '@/services/game/guestIdentity';
 import {
   beginDrawingRound,
   completeJudging,
@@ -15,6 +15,8 @@ import {
   fetchRoomSnapshot,
   joinGame,
   markReveal,
+  PlayerRegistrationError,
+  registerOrTouchPlayer,
   requestNextRound,
   setReady,
   startRoundIfReady,
@@ -292,8 +294,29 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  /**
+   * The single registration boundary: local identity -> (rotate if legacy)
+   * -> register_or_touch_player. Never loops -- a server-reported legacy
+   * identity rotates and retries exactly once; a wrong secret is an
+   * authorization/integrity error and is propagated, never rotated past.
+   */
   const ensureIdentity = useCallback(async (displayName?: string) => {
-    const next = await getGuestIdentity(displayName);
+    let next = await getGuestIdentity(displayName);
+    if (!next.playerSecret) {
+      next = await rotateGuestIdentity();
+    }
+
+    try {
+      await registerOrTouchPlayer(next.playerId, next.displayName, next.playerSecret!);
+    } catch (err) {
+      if (err instanceof PlayerRegistrationError && err.code === 'legacy_identity_requires_rotation') {
+        next = await rotateGuestIdentity();
+        await registerOrTouchPlayer(next.playerId, next.displayName, next.playerSecret!);
+      } else {
+        throw err;
+      }
+    }
+
     setIdentity(next);
     return next;
   }, []);
@@ -318,14 +341,18 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       winner,
       loser,
       createRoom: async (displayName) => {
-        const player = await ensureIdentity(displayName);
-        const ok = await runRemote(() => createGame(player.playerId, player.displayName));
+        const ok = await runRemote(async () => {
+          const player = await ensureIdentity(displayName);
+          return createGame(player.playerId);
+        });
         if (ok) track('game_created');
         return ok;
       },
       joinRoom: async (roomCode, displayName) => {
-        const player = await ensureIdentity(displayName);
-        const ok = await runRemote(() => joinGame(roomCode, player.playerId, player.displayName));
+        const ok = await runRemote(async () => {
+          const player = await ensureIdentity(displayName);
+          return joinGame(roomCode, player.playerId);
+        });
         if (ok) track('game_joined', { roomCode });
         return ok;
       },

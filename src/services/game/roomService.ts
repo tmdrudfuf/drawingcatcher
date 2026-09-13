@@ -199,15 +199,37 @@ export async function fetchRoomSnapshot(gameId: string): Promise<RoomSnapshot> {
   };
 }
 
-async function upsertPlayer(playerId: string, displayName: string) {
-  const client = requireClient();
-  const { error } = await client.from('players').upsert({ id: playerId, display_name: displayName });
-  if (error) throw new Error(error.message);
+/** Distinguishable failures from register_or_touch_player (see the M4C step 5A migration). */
+export class PlayerRegistrationError extends Error {
+  code: 'legacy_identity_requires_rotation' | 'invalid_player_secret';
+  constructor(code: 'legacy_identity_requires_rotation' | 'invalid_player_secret', message: string) {
+    super(message);
+    this.code = code;
+  }
 }
 
-export async function createGame(playerId: string, displayName: string): Promise<RoomSnapshot> {
+/**
+ * The only way a player row is created or touched now -- replaces the old
+ * direct `players` upsert. Proves ownership of playerId via playerSecret
+ * before display_name is ever written; a legacy playerId (no credential) or
+ * a wrong secret both fail distinguishably rather than silently succeeding.
+ */
+export async function registerOrTouchPlayer(playerId: string, displayName: string, playerSecret: string): Promise<void> {
   const client = requireClient();
-  await upsertPlayer(playerId, displayName);
+  const { error } = await client.rpc('register_or_touch_player', {
+    p_player_id: playerId,
+    p_display_name: displayName,
+    p_secret: playerSecret,
+  });
+  if (!error) return;
+  if (error.message === 'legacy_identity_requires_rotation' || error.message === 'invalid_player_secret') {
+    throw new PlayerRegistrationError(error.message, error.message);
+  }
+  throw new Error(error.message);
+}
+
+export async function createGame(playerId: string): Promise<RoomSnapshot> {
+  const client = requireClient();
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const roomCode = generateRoomCode();
@@ -231,12 +253,10 @@ export async function createGame(playerId: string, displayName: string): Promise
   throw new Error('Could not generate a unique room code. Try again.');
 }
 
-export async function joinGame(roomCodeInput: string, playerId: string, displayName: string): Promise<RoomSnapshot> {
+export async function joinGame(roomCodeInput: string, playerId: string): Promise<RoomSnapshot> {
   const client = requireClient();
   const roomCode = normalizeRoomCode(roomCodeInput);
   if (roomCode.length !== 4) throw new Error('Enter a 4-character room code.');
-
-  await upsertPlayer(playerId, displayName);
 
   const { data: game, error } = await client
     .from('games')

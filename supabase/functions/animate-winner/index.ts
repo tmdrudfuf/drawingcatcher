@@ -12,6 +12,7 @@ type AnimateWinnerRequest =
       gameId: string;
       roundId: string;
       playerId: string;
+      playerSecret: string;
     }
   | {
       action: 'status';
@@ -121,6 +122,7 @@ function parseRequest(value: unknown): AnimateWinnerRequest {
       gameId: requiredString(body, 'gameId'),
       roundId: requiredString(body, 'roundId'),
       playerId: requiredString(body, 'playerId'),
+      playerSecret: requiredString(body, 'playerSecret'),
     };
   }
   if (body.action === 'status') {
@@ -152,6 +154,36 @@ function notImplemented(action: AnimateWinnerRequest['action']): Response {
     },
     501,
   );
+}
+
+/**
+ * Proves the HTTP caller actually holds playerId's credential before any
+ * server-side lookup or state change runs on its behalf (see the M4C step
+ * 5A/5B migrations for the credential design). Delegates the actual secret
+ * comparison to the verify_player_secret SECURITY DEFINER RPC so the hash
+ * and comparison never leave the database — this function only ever sees a
+ * boolean back.
+ *
+ * A `false` result (wrong secret) and an RPC/transport error are distinct
+ * failure modes: a bad secret is a normal 401, but an infra failure must
+ * never be silently treated as "not authorized" -- it is surfaced as a
+ * db_error 500 instead, same convention as every other admin call in this
+ * function.
+ */
+async function verifyPlayerOwnership(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  playerId: string,
+  playerSecret: string,
+): Promise<void> {
+  const { data, error } = await admin.rpc('verify_player_secret', {
+    p_player_id: playerId,
+    p_secret: playerSecret,
+  });
+  if (error) throw new StructuredError('db_error', error.message, 500);
+  if (data !== true) {
+    throw new StructuredError('not_authorized', 'Player authorization failed.', 401);
+  }
 }
 
 /**
@@ -333,6 +365,9 @@ Deno.serve(async (req) => {
 
   if (request.action === 'start') {
     try {
+      await verifyPlayerOwnership(admin, request.playerId, request.playerSecret);
+      console.log('[animate-winner] start_authorized');
+
       const { roundSubmissionId } = await verifyWinnerSubmission(
         admin,
         request.gameId,
