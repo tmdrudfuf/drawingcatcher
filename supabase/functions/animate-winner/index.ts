@@ -2,14 +2,19 @@ import { createClient } from 'npm:@supabase/supabase-js@2';
 import { encodeBase64 } from 'https://deno.land/std@0.224.0/encoding/base64.ts';
 
 const CHARACTERIZED_BUCKET = 'characterized';
+const ANIMATIONS_BUCKET = 'animations';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 const VEO_MODEL = 'veo-3.1-generate-preview';
 const VEO_CREATE_TIMEOUT_MS = 30_000;
+const VEO_POLL_TIMEOUT_MS = 20_000;
+const VEO_DOWNLOAD_TIMEOUT_MS = 30_000;
+const MAX_GENERATED_VIDEO_BYTES = 100 * 1024 * 1024;
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
-const MAX_SWEEP_LIMIT = 100;
+const DEFAULT_SWEEP_LIMIT = 5;
+const MAX_SWEEP_LIMIT = 10;
 
 const ANIMATION_PROMPT = `Animate this exact character with one small playful, funny motion.
 
@@ -35,6 +40,10 @@ type AnimateWinnerRequest =
   | {
       action: 'status';
       jobId: string;
+      gameId: string;
+      roundId: string;
+      playerId: string;
+      playerSecret: string;
     }
   | {
       action: 'sweep';
@@ -75,6 +84,50 @@ type VeoCreateResult =
       errorCode: string;
       message: string;
     };
+
+type VeoPollResult =
+  | { outcome: 'pending'; httpStatus: 200 }
+  | { outcome: 'completed'; httpStatus: 200; videoUri: string }
+  | { outcome: 'failed'; httpStatus: 200; providerError: ProviderErrorSummary }
+  | {
+      outcome: 'recoverable_error';
+      httpStatus: number | null;
+      errorCode: string;
+      message: string;
+    };
+
+interface VideoAsset {
+  bytes: Uint8Array;
+  contentType: string;
+  contentLength: number;
+}
+
+type CompletionResult =
+  | {
+      outcome: 'state';
+      job: AnimationJobRow;
+      providerPolled: boolean;
+      storageDisposition?: 'existing' | 'uploaded' | 'race_recovered';
+    }
+  | {
+      outcome: 'recoverable_error';
+      job: AnimationJobRow;
+      errorCode: string;
+      message: string;
+      providerPolled: boolean;
+      httpStatus?: number | null;
+    };
+
+interface CompletionDependencies {
+  pollOperation: (apiKey: string, operationName: string) => Promise<VeoPollResult>;
+  downloadVideo: (apiKey: string, videoUri: string) => Promise<VideoAsset>;
+  readStoredVideo: (videoPath: string) => Promise<VideoAsset | null>;
+  storeVideo: (videoPath: string, video: VideoAsset) => Promise<'uploaded' | 'race_recovered'>;
+  markPolled: (jobId: string) => Promise<AnimationJobRow>;
+  markDownloading: (jobId: string) => Promise<AnimationJobRow>;
+  markProviderFailed: (jobId: string, providerError: ProviderErrorSummary) => Promise<AnimationJobRow>;
+  finalize: (jobId: string, videoPath: string, video: VideoAsset) => Promise<AnimationJobRow>;
+}
 
 function jsonResponse(
   body: Record<string, unknown>,
@@ -176,11 +229,16 @@ function isSafeOperationName(value: string): boolean {
   );
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await fetchImpl(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -285,6 +343,180 @@ async function createVeoAnimation(
   return { outcome: 'accepted', httpStatus: 200, operationName };
 }
 
+function findVideoUri(operation: unknown): string | null {
+  if (!operation || typeof operation !== 'object') return null;
+  const response = (operation as Record<string, unknown>).response as Record<string, unknown> | undefined;
+  const generateVideoResponse = response?.generateVideoResponse as Record<string, unknown> | undefined;
+  const samples = generateVideoResponse?.generatedSamples;
+  if (!Array.isArray(samples) || !samples.length) return null;
+  const video = (samples[0] as Record<string, unknown> | undefined)?.video as Record<string, unknown> | undefined;
+  return typeof video?.uri === 'string' ? video.uri : null;
+}
+
+function isSafeVideoUri(value: string): boolean {
+  if (!value || value !== value.trim()) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      url.host === 'generativelanguage.googleapis.com' &&
+      !url.username &&
+      !url.password
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function pollVeoOperation(
+  apiKey: string,
+  operationName: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<VeoPollResult> {
+  if (!isSafeOperationName(operationName)) {
+    return {
+      outcome: 'recoverable_error',
+      httpStatus: null,
+      errorCode: 'veo_operation_name_invalid',
+      message: 'The persisted Veo operation name is invalid.',
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(
+      `${GEMINI_BASE_URL}/${operationName}`,
+      { method: 'GET', headers: { 'x-goog-api-key': apiKey } },
+      VEO_POLL_TIMEOUT_MS,
+      fetchImpl,
+    );
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === 'AbortError';
+    return {
+      outcome: 'recoverable_error',
+      httpStatus: null,
+      errorCode: timedOut ? 'veo_poll_timeout' : 'veo_poll_transport_failed',
+      message: timedOut ? 'The Veo operation poll timed out.' : 'The Veo operation poll could not be completed.',
+    };
+  }
+
+  let payload: unknown;
+  try {
+    payload = await parseProviderJson(response);
+  } catch {
+    return {
+      outcome: 'recoverable_error',
+      httpStatus: response.status,
+      errorCode: 'veo_poll_response_unreadable',
+      message: 'The Veo operation response could not be read.',
+    };
+  }
+  if (!response.ok) {
+    return {
+      outcome: 'recoverable_error',
+      httpStatus: response.status,
+      errorCode: 'veo_poll_http_failed',
+      message: `The Veo operation poll returned HTTP ${response.status}.`,
+    };
+  }
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {
+      outcome: 'recoverable_error',
+      httpStatus: 200,
+      errorCode: 'veo_poll_response_invalid',
+      message: 'The Veo operation response was invalid.',
+    };
+  }
+  const record = payload as Record<string, unknown>;
+  if (record.done !== true) return { outcome: 'pending', httpStatus: 200 };
+  if (record.error) {
+    return {
+      outcome: 'failed',
+      httpStatus: 200,
+      providerError: providerErrorSummary(record.error, 'The Veo operation completed with an error.'),
+    };
+  }
+
+  const videoUri = findVideoUri(payload);
+  if (!videoUri || !isSafeVideoUri(videoUri)) {
+    return {
+      outcome: 'recoverable_error',
+      httpStatus: 200,
+      errorCode: 'veo_completed_video_reference_missing',
+      message: 'The completed Veo operation did not contain a safe video reference.',
+    };
+  }
+  return { outcome: 'completed', httpStatus: 200, videoUri };
+}
+
+function normalizedVideoContentType(value: string | null): string | null {
+  if (!value) return null;
+  const contentType = value.split(';', 1)[0].trim().toLowerCase();
+  return contentType.startsWith('video/') ? contentType : null;
+}
+
+function validateVideoBytes(bytes: Uint8Array, contentTypeHeader: string | null): VideoAsset {
+  const contentType = normalizedVideoContentType(contentTypeHeader);
+  if (!contentType) {
+    throw new StructuredError('generated_video_invalid_type', 'The generated asset is not a video.', 502);
+  }
+  if (contentType !== 'video/mp4') {
+    throw new StructuredError('generated_video_unsupported_type', 'The generated video is not an MP4.', 502);
+  }
+  if (!bytes.length) {
+    throw new StructuredError('generated_video_empty', 'The generated video is empty.', 502);
+  }
+  if (bytes.length > MAX_GENERATED_VIDEO_BYTES) {
+    throw new StructuredError('generated_video_too_large', 'The generated video exceeds the size limit.', 502);
+  }
+  return { bytes, contentType, contentLength: bytes.length };
+}
+
+async function downloadGeneratedVideo(
+  apiKey: string,
+  videoUri: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<VideoAsset> {
+  if (!isSafeVideoUri(videoUri)) {
+    throw new StructuredError('generated_video_reference_invalid', 'The generated video reference is invalid.', 502);
+  }
+
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(
+      videoUri,
+      { method: 'GET', headers: { 'x-goog-api-key': apiKey }, redirect: 'error' },
+      VEO_DOWNLOAD_TIMEOUT_MS,
+      fetchImpl,
+    );
+  } catch {
+    throw new StructuredError('generated_video_download_failed', 'The generated video could not be downloaded.', 502);
+  }
+  if (response.status !== 200) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new StructuredError(
+      'generated_video_download_http_failed',
+      `The generated video download returned HTTP ${response.status}.`,
+      502,
+    );
+  }
+
+  const declaredLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_GENERATED_VIDEO_BYTES) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new StructuredError('generated_video_too_large', 'The generated video exceeds the size limit.', 502);
+  }
+
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(await response.arrayBuffer());
+  } catch {
+    throw new StructuredError('generated_video_read_failed', 'The generated video could not be read.', 502);
+  }
+  return validateVideoBytes(bytes, response.headers.get('content-type'));
+}
+
 function requiredString(body: Record<string, unknown>, field: string): string {
   const value = body[field];
   if (typeof value !== 'string' || !value.trim()) {
@@ -309,7 +541,14 @@ function parseRequest(value: unknown): AnimateWinnerRequest {
     };
   }
   if (body.action === 'status') {
-    return { action: 'status', jobId: requiredString(body, 'jobId') };
+    return {
+      action: 'status',
+      jobId: requiredString(body, 'jobId'),
+      gameId: requiredString(body, 'gameId'),
+      roundId: requiredString(body, 'roundId'),
+      playerId: requiredString(body, 'playerId'),
+      playerSecret: requiredString(body, 'playerSecret'),
+    };
   }
   if (body.action === 'sweep') {
     const limit = body.limit;
@@ -441,10 +680,37 @@ async function verifyWinnerSubmission(
 
 interface AnimationJobRow {
   id: string;
+  game_id: string;
+  round_id: string;
+  player_id: string;
+  round_submission_id: string;
   status: string;
   entitlement_source: string | null;
+  entitlement_id: string | null;
   paid_generation_requested_at: string | null;
+  veo_operation_name: string | null;
+  video_path: string | null;
+  video_content_type: string | null;
+  video_content_length: number | null;
+  completed_at: string | null;
 }
+
+const ANIMATION_JOB_SELECT = [
+  'id',
+  'game_id',
+  'round_id',
+  'player_id',
+  'round_submission_id',
+  'status',
+  'entitlement_source',
+  'entitlement_id',
+  'paid_generation_requested_at',
+  'veo_operation_name',
+  'video_path',
+  'video_content_type',
+  'video_content_length',
+  'completed_at',
+].join(', ');
 
 /** Only the fields safe to return to a client: no storage paths, operation names, or raw rows. */
 function jobResponsePayload(roundSubmissionId: string, job: AnimationJobRow): Record<string, unknown> {
@@ -466,7 +732,7 @@ async function findExistingAnimationJob(
 ): Promise<AnimationJobRow | null> {
   const { data, error } = await admin
     .from('animation_jobs')
-    .select('id, status, entitlement_source, paid_generation_requested_at')
+    .select(ANIMATION_JOB_SELECT)
     .eq('round_submission_id', roundSubmissionId)
     .maybeSingle();
   if (error) throw new StructuredError('db_error', error.message, 500);
@@ -512,7 +778,7 @@ async function findAnimationJobById(
 ): Promise<AnimationJobRow> {
   const { data, error } = await admin
     .from('animation_jobs')
-    .select('id, status, entitlement_source, paid_generation_requested_at')
+    .select(ANIMATION_JOB_SELECT)
     .eq('id', jobId)
     .maybeSingle();
   if (error) throw new StructuredError('db_error', error.message, 500);
@@ -601,12 +867,400 @@ async function updateAnimationJob(
     .from('animation_jobs')
     .update(updates)
     .eq('id', jobId)
-    .select('id, status, entitlement_source, paid_generation_requested_at')
+    .select(ANIMATION_JOB_SELECT)
     .single();
   if (error || !data) {
     throw new StructuredError('db_error', 'Animation job state could not be persisted.', 500);
   }
   return data;
+}
+
+function animationVideoPath(job: AnimationJobRow): string {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (!uuid.test(job.game_id) || !uuid.test(job.round_id) || !uuid.test(job.round_submission_id)) {
+    throw new StructuredError('animation_job_identity_invalid', 'Animation job identity is invalid.', 500);
+  }
+  return 'games/' + job.game_id + '/rounds/' + job.round_id + '/' + job.round_submission_id + '.mp4';
+}
+
+function storageErrorStatus(error: unknown): number | null {
+  if (!error || typeof error !== 'object') return null;
+  const record = error as Record<string, unknown>;
+  const value = record.statusCode ?? record.status;
+  const parsed = typeof value === 'string' ? Number(value) : value;
+  return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : null;
+}
+
+function storageErrorMessage(error: unknown): string {
+  if (!error || typeof error !== 'object') return '';
+  const value = (error as Record<string, unknown>).message;
+  return typeof value === 'string' ? value.toLowerCase() : '';
+}
+
+function isStorageNotFound(error: unknown): boolean {
+  const status = storageErrorStatus(error);
+  const message = storageErrorMessage(error);
+  return status === 404 || message.includes('not found') || message.includes('does not exist');
+}
+
+function isStorageConflict(error: unknown): boolean {
+  const status = storageErrorStatus(error);
+  const message = storageErrorMessage(error);
+  return status === 409 || message.includes('already exists') || message.includes('duplicate');
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digestInput = bytes.slice().buffer;
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', digestInput));
+  return Array.from(digest, (value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+async function videosMatch(left: VideoAsset, right: VideoAsset): Promise<boolean> {
+  if (left.contentType !== right.contentType || left.contentLength !== right.contentLength) return false;
+  return safeEqual(await sha256Hex(left.bytes), await sha256Hex(right.bytes));
+}
+
+async function readStoredVideo(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  videoPath: string,
+): Promise<VideoAsset | null> {
+  const { data, error } = await admin.storage.from(ANIMATIONS_BUCKET).download(videoPath);
+  if (error) {
+    if (isStorageNotFound(error)) return null;
+    throw new StructuredError('animation_storage_read_failed', 'The stored animation could not be inspected.', 502);
+  }
+  if (!data) {
+    throw new StructuredError('animation_storage_read_failed', 'The stored animation could not be inspected.', 502);
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(await data.arrayBuffer());
+  } catch {
+    throw new StructuredError('animation_storage_read_failed', 'The stored animation could not be read.', 502);
+  }
+  return validateVideoBytes(bytes, data.type);
+}
+
+async function storeVideoWithoutOverwrite(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  videoPath: string,
+  video: VideoAsset,
+): Promise<'uploaded' | 'race_recovered'> {
+  const { error } = await admin.storage.from(ANIMATIONS_BUCKET).upload(videoPath, video.bytes, {
+    contentType: video.contentType,
+    upsert: false,
+  });
+  if (!error) return 'uploaded';
+  if (!isStorageConflict(error)) {
+    throw new StructuredError('animation_storage_upload_failed', 'The animation could not be stored.', 502);
+  }
+
+  const existing = await readStoredVideo(admin, videoPath);
+  if (!existing || !(await videosMatch(existing, video))) {
+    throw new StructuredError(
+      'animation_storage_conflict',
+      'A different object already exists at the animation storage path.',
+      409,
+    );
+  }
+  return 'race_recovered';
+}
+
+async function markAnimationJobPolled(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  jobId: string,
+): Promise<AnimationJobRow> {
+  return await updateAnimationJob(admin, jobId, { last_polled_at: new Date().toISOString() });
+}
+
+async function markAnimationJobDownloading(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  jobId: string,
+): Promise<AnimationJobRow> {
+  const { data, error } = await admin
+    .from('animation_jobs')
+    .update({ status: 'downloading', last_polled_at: new Date().toISOString() })
+    .eq('id', jobId)
+    .eq('status', 'operation_pending')
+    .select(ANIMATION_JOB_SELECT)
+    .maybeSingle();
+  if (error) throw new StructuredError('db_error', 'Animation download state could not be persisted.', 500);
+  return data ?? await findAnimationJobById(admin, jobId);
+}
+
+async function markAnimationJobProviderFailed(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  jobId: string,
+  providerError: ProviderErrorSummary,
+): Promise<AnimationJobRow> {
+  const now = new Date().toISOString();
+  const { data, error } = await admin
+    .from('animation_jobs')
+    .update({
+      status: 'failed',
+      last_polled_at: now,
+      provider_error_code: providerError.code === null ? null : String(providerError.code).slice(0, 200),
+      provider_error_status: providerError.status,
+      error_code: 'veo_operation_failed',
+      error_message: providerError.message,
+      failed_at: now,
+    })
+    .eq('id', jobId)
+    .in('status', ['operation_pending', 'downloading'])
+    .select(ANIMATION_JOB_SELECT)
+    .maybeSingle();
+  if (error) throw new StructuredError('db_error', 'Animation failure state could not be persisted.', 500);
+  return data ?? await findAnimationJobById(admin, jobId);
+}
+
+async function finalizeAnimationJob(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  jobId: string,
+  videoPath: string,
+  video: VideoAsset,
+): Promise<AnimationJobRow> {
+  const { data, error } = await admin.rpc('finalize_animation_job', {
+    p_job_id: jobId,
+    p_video_path: videoPath,
+    p_video_content_type: video.contentType,
+    p_video_content_length: video.contentLength,
+  });
+  if (error) {
+    if (error.code === 'P0001' && error.message.includes('entitlement_finalization_conflict')) {
+      throw new StructuredError('entitlement_finalization_conflict', 'Animation entitlement state is inconsistent.', 409);
+    }
+    if (error.code === 'P0001' && error.message.includes('finalization_conflict')) {
+      throw new StructuredError('finalization_conflict', 'Animation finalization conflicts with durable state.', 409);
+    }
+    throw new StructuredError('animation_finalize_failed', 'Animation finalization could not be completed.', 500);
+  }
+  const finalJob: AnimationJobRow | undefined = Array.isArray(data) ? data[0] : data;
+  if (!finalJob || finalJob.status !== 'completed') {
+    throw new StructuredError('animation_finalize_failed', 'Animation finalization returned invalid state.', 500);
+  }
+  return finalJob;
+}
+
+function completionDependencies(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+): CompletionDependencies {
+  return {
+    pollOperation: pollVeoOperation,
+    downloadVideo: downloadGeneratedVideo,
+    readStoredVideo: (videoPath) => readStoredVideo(admin, videoPath),
+    storeVideo: (videoPath, video) => storeVideoWithoutOverwrite(admin, videoPath, video),
+    markPolled: (jobId) => markAnimationJobPolled(admin, jobId),
+    markDownloading: (jobId) => markAnimationJobDownloading(admin, jobId),
+    markProviderFailed: (jobId, providerError) => markAnimationJobProviderFailed(admin, jobId, providerError),
+    finalize: (jobId, videoPath, video) => finalizeAnimationJob(admin, jobId, videoPath, video),
+  };
+}
+
+async function completeExistingAnimation(
+  job: AnimationJobRow,
+  apiKey: string,
+  dependencies: CompletionDependencies,
+): Promise<CompletionResult> {
+  if (job.status === 'completed' || job.status === 'failed' || job.status === 'ambiguous') {
+    return { outcome: 'state', job, providerPolled: false };
+  }
+  if (job.status !== 'operation_pending' && job.status !== 'downloading') {
+    throw new StructuredError('animation_job_not_pollable', 'Animation job is not ready for completion.', 409);
+  }
+  if (!job.paid_generation_requested_at || !job.veo_operation_name) {
+    throw new StructuredError('animation_job_not_pollable', 'Animation job lacks a paid operation.', 409);
+  }
+
+  const videoPath = animationVideoPath(job);
+  const existingVideo = job.status === 'downloading'
+    ? await dependencies.readStoredVideo(videoPath)
+    : null;
+  const pollResult = await dependencies.pollOperation(apiKey, job.veo_operation_name);
+
+  if (pollResult.outcome === 'pending') {
+    const pendingJob = await dependencies.markPolled(job.id);
+    return { outcome: 'state', job: pendingJob, providerPolled: true };
+  }
+  if (pollResult.outcome === 'failed') {
+    const failedJob = await dependencies.markProviderFailed(job.id, pollResult.providerError);
+    return { outcome: 'state', job: failedJob, providerPolled: true };
+  }
+  if (pollResult.outcome === 'recoverable_error') {
+    let currentJob = job;
+    try {
+      currentJob = await dependencies.markPolled(job.id);
+    } catch {
+      console.error('[animate-winner] poll timestamp persistence failed');
+    }
+    return {
+      outcome: 'recoverable_error',
+      job: currentJob,
+      errorCode: pollResult.errorCode,
+      message: pollResult.message,
+      providerPolled: true,
+      httpStatus: pollResult.httpStatus,
+    };
+  }
+
+  const downloadingJob = job.status === 'operation_pending'
+    ? await dependencies.markDownloading(job.id)
+    : await dependencies.markPolled(job.id);
+  if (downloadingJob.status === 'completed' || downloadingJob.status === 'failed' || downloadingJob.status === 'ambiguous') {
+    return { outcome: 'state', job: downloadingJob, providerPolled: true };
+  }
+  if (downloadingJob.status !== 'downloading') {
+    throw new StructuredError('animation_job_state_conflict', 'Animation job state changed during completion.', 409);
+  }
+
+  let video: VideoAsset;
+  try {
+    video = await dependencies.downloadVideo(apiKey, pollResult.videoUri);
+  } catch (error) {
+    const structured = error instanceof StructuredError
+      ? error
+      : new StructuredError('generated_video_download_failed', 'The generated video could not be downloaded.', 502);
+    return {
+      outcome: 'recoverable_error',
+      job: downloadingJob,
+      errorCode: structured.code,
+      message: structured.message,
+      providerPolled: true,
+    };
+  }
+
+  let storageDisposition: 'existing' | 'uploaded' | 'race_recovered';
+  if (existingVideo) {
+    if (!(await videosMatch(existingVideo, video))) {
+      return {
+        outcome: 'recoverable_error',
+        job: downloadingJob,
+        errorCode: 'animation_storage_conflict',
+        message: 'A different object already exists at the animation storage path.',
+        providerPolled: true,
+      };
+    }
+    storageDisposition = 'existing';
+  } else {
+    try {
+      storageDisposition = await dependencies.storeVideo(videoPath, video);
+    } catch (error) {
+      const structured = error instanceof StructuredError
+        ? error
+        : new StructuredError('animation_storage_upload_failed', 'The animation could not be stored.', 502);
+      return {
+        outcome: 'recoverable_error',
+        job: downloadingJob,
+        errorCode: structured.code,
+        message: structured.message,
+        providerPolled: true,
+      };
+    }
+  }
+
+  try {
+    const completed = await dependencies.finalize(job.id, videoPath, video);
+    return { outcome: 'state', job: completed, providerPolled: true, storageDisposition };
+  } catch (error) {
+    const structured = error instanceof StructuredError
+      ? error
+      : new StructuredError('animation_finalize_failed', 'Animation finalization could not be completed.', 500);
+    return {
+      outcome: 'recoverable_error',
+      job: downloadingJob,
+      errorCode: structured.code,
+      message: structured.message,
+      providerPolled: true,
+    };
+  }
+}
+
+function completionResponse(result: CompletionResult): Response {
+  const payload = {
+    ...jobResponsePayload(result.job.round_submission_id, result.job),
+    providerPolled: result.providerPolled,
+    videoReady: result.job.status === 'completed',
+    automaticGenerationRetryAllowed: false,
+  };
+  if (result.outcome === 'state') {
+    return jsonResponse({ ...payload, storageDisposition: result.storageDisposition ?? null });
+  }
+  return jsonResponse(
+    {
+      ...payload,
+      error: result.errorCode,
+      message: result.message,
+      providerHttpStatus: result.httpStatus ?? null,
+      completionRetryAllowed: true,
+    },
+    result.errorCode === 'animation_storage_conflict' || result.errorCode.endsWith('_conflict') ? 409 : 502,
+  );
+}
+
+function resolveVeoApiKey(): string {
+  const apiKey = Deno.env.get('GEMINI_API_KEY')?.trim();
+  if (!apiKey) {
+    console.error('[animate-winner] Veo API credential is not configured');
+    throw new StructuredError('server_misconfigured', 'Winner animation is not configured.', 500);
+  }
+  return apiKey;
+}
+
+async function listSweepAnimationJobs(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  limit: number,
+): Promise<AnimationJobRow[]> {
+  const { data, error } = await admin
+    .from('animation_jobs')
+    .select(ANIMATION_JOB_SELECT)
+    .in('status', ['operation_pending', 'downloading'])
+    .not('paid_generation_requested_at', 'is', null)
+    .not('veo_operation_name', 'is', null)
+    .order('last_polled_at', { ascending: true, nullsFirst: true })
+    .order('updated_at', { ascending: true })
+    .limit(limit);
+  if (error) throw new StructuredError('db_error', 'Animation sweep jobs could not be loaded.', 500);
+  return data ?? [];
+}
+
+async function runCompletionSweep(
+  jobs: AnimationJobRow[],
+  apiKey: string,
+  dependencies: CompletionDependencies,
+): Promise<Record<string, unknown>[]> {
+  const results: Record<string, unknown>[] = [];
+  for (const job of jobs.slice(0, MAX_SWEEP_LIMIT)) {
+    try {
+      const result = await completeExistingAnimation(job, apiKey, dependencies);
+      results.push({
+        jobId: job.id,
+        outcome: result.outcome,
+        jobStatus: result.job.status,
+        providerPolled: result.providerPolled,
+        error: result.outcome === 'recoverable_error' ? result.errorCode : null,
+      });
+    } catch (error) {
+      const structured = error instanceof StructuredError
+        ? error
+        : new StructuredError('unexpected_error', 'Animation sweep item failed unexpectedly.', 500);
+      if (!(error instanceof StructuredError)) console.error('[animate-winner] sweep item failed unexpectedly');
+      results.push({
+        jobId: job.id,
+        outcome: 'error',
+        jobStatus: job.status,
+        providerPolled: false,
+        error: structured.code,
+      });
+    }
+  }
+  return results;
 }
 
 Deno.serve(async (req) => {
@@ -648,6 +1302,84 @@ Deno.serve(async (req) => {
 
   if (request.action === 'sweep' && !isSecretKeyRequest(req, supabaseSecretKey)) {
     return jsonResponse({ error: 'forbidden', message: 'sweep requires secret-key authorization.' }, 403);
+  }
+
+  if (request.action === 'status') {
+    try {
+      await verifyPlayerOwnership(admin, request.playerId, request.playerSecret);
+      const { roundSubmissionId } = await verifyWinnerSubmission(
+        admin,
+        request.gameId,
+        request.roundId,
+        request.playerId,
+      );
+      const job = await findAnimationJobById(admin, request.jobId);
+      if (
+        job.game_id !== request.gameId ||
+        job.round_id !== request.roundId ||
+        job.player_id !== request.playerId ||
+        job.round_submission_id !== roundSubmissionId
+      ) {
+        throw new StructuredError('animation_job_mismatch', 'Animation job does not match the winner request.', 409);
+      }
+
+      if (job.status === 'completed' || job.status === 'failed' || job.status === 'ambiguous') {
+        return completionResponse({ outcome: 'state', job, providerPolled: false });
+      }
+      if (job.status !== 'operation_pending' && job.status !== 'downloading') {
+        return jsonResponse({
+          ...jobResponsePayload(roundSubmissionId, job),
+          providerPolled: false,
+          videoReady: false,
+          automaticGenerationRetryAllowed: false,
+        });
+      }
+
+      const result = await completeExistingAnimation(job, resolveVeoApiKey(), completionDependencies(admin));
+      console.log('[animate-winner] status_processed', {
+        jobStatus: result.job.status,
+        outcome: result.outcome,
+        providerPolled: result.providerPolled,
+      });
+      return completionResponse(result);
+    } catch (error) {
+      const structured = error instanceof StructuredError
+        ? error
+        : new StructuredError('unexpected_error', 'Animation status failed unexpectedly.', 500);
+      if (!(error instanceof StructuredError)) console.error('[animate-winner] status failed unexpectedly');
+      console.log('[animate-winner] status_failed', { code: structured.code });
+      return jsonResponse(
+        {
+          error: structured.code,
+          message: structured.message,
+          automaticGenerationRetryAllowed: false,
+        },
+        structured.status,
+      );
+    }
+  }
+
+  if (request.action === 'sweep') {
+    const limit = request.limit ?? DEFAULT_SWEEP_LIMIT;
+    try {
+      const jobs = await listSweepAnimationJobs(admin, limit);
+      if (!jobs.length) {
+        return jsonResponse({ action: 'sweep', requestedLimit: limit, processed: 0, results: [] });
+      }
+
+      const apiKey = resolveVeoApiKey();
+      const dependencies = completionDependencies(admin);
+      const results = await runCompletionSweep(jobs, apiKey, dependencies);
+      console.log('[animate-winner] sweep_processed', { requestedLimit: limit, processed: results.length });
+      return jsonResponse({ action: 'sweep', requestedLimit: limit, processed: results.length, results });
+    } catch (error) {
+      const structured = error instanceof StructuredError
+        ? error
+        : new StructuredError('unexpected_error', 'Animation sweep failed unexpectedly.', 500);
+      if (!(error instanceof StructuredError)) console.error('[animate-winner] sweep failed unexpectedly');
+      console.log('[animate-winner] sweep_failed', { code: structured.code });
+      return jsonResponse({ error: structured.code, message: structured.message }, structured.status);
+    }
   }
 
   if (request.action === 'start') {
@@ -850,5 +1582,5 @@ Deno.serve(async (req) => {
     }
   }
 
-  return notImplemented(request.action);
+  return jsonResponse({ error: 'invalid_action', message: 'Unsupported animate-winner action.' }, 400);
 });
