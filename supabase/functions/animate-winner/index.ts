@@ -1,5 +1,12 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { encodeBase64 } from 'https://deno.land/std@0.224.0/encoding/base64.ts';
+import {
+  issueRewardedAdCorrelation,
+  MAX_SWEEP_LIMIT,
+  parseRequest,
+  StructuredError,
+  type AnimateWinnerRequest,
+} from './shared.ts';
 
 const CHARACTERIZED_BUCKET = 'characterized';
 const ANIMATIONS_BUCKET = 'animations';
@@ -14,7 +21,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 const DEFAULT_SWEEP_LIMIT = 5;
-const MAX_SWEEP_LIMIT = 10;
+const REVEAL_VIDEO_SIGNED_URL_TTL_SECONDS = 60;
 
 const ANIMATION_PROMPT = `Animate this exact character with one small playful, funny motion.
 
@@ -29,37 +36,7 @@ surprised reaction.
 No cuts. No dramatic camera movement. No new characters. No extra limbs.
 No text.`;
 
-type AnimateWinnerRequest =
-  | {
-      action: 'start';
-      gameId: string;
-      roundId: string;
-      playerId: string;
-      playerSecret: string;
-    }
-  | {
-      action: 'status';
-      jobId: string;
-      gameId: string;
-      roundId: string;
-      playerId: string;
-      playerSecret: string;
-    }
-  | {
-      action: 'sweep';
-      limit?: number;
-    };
-
-class StructuredError extends Error {
-  code: string;
-  status: number;
-
-  constructor(code: string, message: string, status: number) {
-    super(message);
-    this.code = code;
-    this.status = status;
-  }
-}
+type RevealStatusRequest = Extract<AnimateWinnerRequest, { action: 'reveal-status' }>;
 
 interface ProviderErrorSummary {
   code: number | string | null;
@@ -517,56 +494,6 @@ async function downloadGeneratedVideo(
   return validateVideoBytes(bytes, response.headers.get('content-type'));
 }
 
-function requiredString(body: Record<string, unknown>, field: string): string {
-  const value = body[field];
-  if (typeof value !== 'string' || !value.trim()) {
-    throw new StructuredError('invalid_request', `${field} must be a non-empty string.`, 400);
-  }
-  return value.trim();
-}
-
-function parseRequest(value: unknown): AnimateWinnerRequest {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new StructuredError('invalid_request', 'Request body must be a JSON object.', 400);
-  }
-  const body = value as Record<string, unknown>;
-
-  if (body.action === 'start') {
-    return {
-      action: 'start',
-      gameId: requiredString(body, 'gameId'),
-      roundId: requiredString(body, 'roundId'),
-      playerId: requiredString(body, 'playerId'),
-      playerSecret: requiredString(body, 'playerSecret'),
-    };
-  }
-  if (body.action === 'status') {
-    return {
-      action: 'status',
-      jobId: requiredString(body, 'jobId'),
-      gameId: requiredString(body, 'gameId'),
-      roundId: requiredString(body, 'roundId'),
-      playerId: requiredString(body, 'playerId'),
-      playerSecret: requiredString(body, 'playerSecret'),
-    };
-  }
-  if (body.action === 'sweep') {
-    const limit = body.limit;
-    if (
-      limit !== undefined &&
-      (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > MAX_SWEEP_LIMIT)
-    ) {
-      throw new StructuredError(
-        'invalid_request',
-        `limit must be an integer between 1 and ${MAX_SWEEP_LIMIT}.`,
-        400,
-      );
-    }
-    return { action: 'sweep', limit };
-  }
-  throw new StructuredError('invalid_action', "action must be 'start', 'status', or 'sweep'.", 400);
-}
-
 function notImplemented(action: AnimateWinnerRequest['action']): Response {
   return jsonResponse(
     {
@@ -678,6 +605,98 @@ async function verifyWinnerSubmission(
   return { roundSubmissionId: submission.id, characterizedPath: submission.characterized_path };
 }
 
+async function findWinningSubmissionForRoomMember(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  gameId: string,
+  roundId: string,
+  callerPlayerId: string,
+): Promise<string> {
+  const { data: membership, error: membershipError } = await admin
+    .from('game_players')
+    .select('player_id')
+    .eq('game_id', gameId)
+    .eq('player_id', callerPlayerId)
+    .maybeSingle();
+  if (membershipError) throw new StructuredError('db_error', membershipError.message, 500);
+  if (!membership) {
+    throw new StructuredError('forbidden', 'Player is not a member of this game.', 403);
+  }
+
+  const { data: round, error: roundError } = await admin
+    .from('rounds')
+    .select('id, game_id, winner_player_id')
+    .eq('id', roundId)
+    .maybeSingle();
+  if (roundError) throw new StructuredError('db_error', roundError.message, 500);
+  if (!round) throw new StructuredError('round_not_found', 'No such round.', 404);
+  if (round.game_id !== gameId) {
+    throw new StructuredError('round_game_mismatch', 'The round does not belong to that game.', 409);
+  }
+  if (!round.winner_player_id) {
+    throw new StructuredError('winner_not_ready', 'This round has not produced a winner yet.', 409);
+  }
+
+  const { data: submission, error: submissionError } = await admin
+    .from('round_submissions')
+    .select('id')
+    .eq('round_id', roundId)
+    .eq('player_id', round.winner_player_id)
+    .maybeSingle();
+  if (submissionError) throw new StructuredError('db_error', submissionError.message, 500);
+  if (!submission) {
+    throw new StructuredError('submission_not_found', 'No winning submission found for that round.', 404);
+  }
+  return submission.id;
+}
+
+/**
+ * Cheap follow-up lookup for the 'request-rewarded-ad-correlation' action
+ * only: findWinningSubmissionForRoomMember above already proved the caller
+ * is a room member and that the round has a ready winner, but it returns
+ * only the submission id. This re-reads the same already-fetched round row
+ * by primary key (indexed, negligible cost) rather than widening that
+ * function's return shape and touching its existing reveal-status callers.
+ */
+async function findRoundWinnerPlayerId(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  roundId: string,
+): Promise<string> {
+  const { data: round, error } = await admin
+    .from('rounds')
+    .select('winner_player_id')
+    .eq('id', roundId)
+    .maybeSingle();
+  if (error) throw new StructuredError('db_error', error.message, 500);
+  if (!round?.winner_player_id) {
+    throw new StructuredError('winner_not_ready', 'This round has not produced a winner yet.', 409);
+  }
+  return round.winner_player_id;
+}
+
+/**
+ * M4E step 3: the minimum read needed to observe "did the SSV callback
+ * verify and grant?" without exposing entitlement ids, transaction ids, or
+ * any other DB internals. `head: true` means Postgres/PostgREST returns
+ * only the count, never the matching rows themselves. This never touches
+ * animation_jobs and never starts anything -- it is purely a count.
+ */
+async function countAvailableRewardedAdEntitlements(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  roundSubmissionId: string,
+): Promise<number> {
+  const { count, error } = await admin
+    .from('animation_entitlements')
+    .select('id', { count: 'exact', head: true })
+    .eq('round_submission_id', roundSubmissionId)
+    .eq('source', 'rewarded_ad')
+    .eq('status', 'available');
+  if (error) throw new StructuredError('db_error', error.message, 500);
+  return typeof count === 'number' ? count : 0;
+}
+
 interface AnimationJobRow {
   id: string;
   game_id: string;
@@ -722,6 +741,95 @@ function jobResponsePayload(roundSubmissionId: string, job: AnimationJobRow): Re
     entitlementSource: job.entitlement_source,
     paidGenerationRequested: job.paid_generation_requested_at !== null,
   };
+}
+
+function revealStatusPayload(job: AnimationJobRow): Record<string, unknown> {
+  return { state: job.status, jobId: job.id };
+}
+
+interface RevealStatusDependencies {
+  verifyOwnership: (playerId: string, playerSecret: string) => Promise<void>;
+  findWinningSubmission: (gameId: string, roundId: string, playerId: string) => Promise<string>;
+  findExistingJob: (roundSubmissionId: string) => Promise<AnimationJobRow | null>;
+  completeExisting: (job: AnimationJobRow) => Promise<CompletionResult>;
+  createSignedVideoUrl: (videoPath: string) => Promise<string>;
+}
+
+async function revealStatusResponse(
+  job: AnimationJobRow,
+  dependencies: RevealStatusDependencies,
+): Promise<Response> {
+  if (job.status !== 'completed') return jsonResponse(revealStatusPayload(job));
+  if (
+    !job.video_path?.trim() ||
+    job.video_content_type !== 'video/mp4' ||
+    job.video_content_length === null ||
+    job.video_content_length <= 0 ||
+    !job.completed_at
+  ) {
+    throw new StructuredError(
+      'animation_video_unavailable',
+      'The completed animation video is unavailable.',
+      500,
+    );
+  }
+
+  const videoUrl = await dependencies.createSignedVideoUrl(job.video_path);
+  return jsonResponse({
+    state: 'completed',
+    jobId: job.id,
+    videoUrl,
+    videoUrlExpiresInSeconds: REVEAL_VIDEO_SIGNED_URL_TTL_SECONDS,
+    videoContentType: job.video_content_type,
+    videoContentLength: job.video_content_length,
+    completedAt: job.completed_at,
+  });
+}
+
+async function handleRevealStatus(
+  request: RevealStatusRequest,
+  dependencies: RevealStatusDependencies,
+): Promise<Response> {
+  await dependencies.verifyOwnership(request.playerId, request.playerSecret);
+  const roundSubmissionId = await dependencies.findWinningSubmission(
+    request.gameId,
+    request.roundId,
+    request.playerId,
+  );
+  const job = await dependencies.findExistingJob(roundSubmissionId);
+  if (!job) return jsonResponse({ state: 'not_requested' });
+
+  if (job.status !== 'operation_pending' && job.status !== 'downloading') {
+    return await revealStatusResponse(job, dependencies);
+  }
+
+  const result = await dependencies.completeExisting(job);
+  if (result.outcome === 'state') {
+    return await revealStatusResponse(result.job, dependencies);
+  }
+  return jsonResponse({
+    ...revealStatusPayload(result.job),
+    recoveryError: result.errorCode,
+    recoveryMessage: result.message,
+  });
+}
+
+async function createRevealVideoSignedUrl(
+  // deno-lint-ignore no-explicit-any
+  admin: any,
+  videoPath: string,
+): Promise<string> {
+  const { data, error } = await admin.storage
+    .from(ANIMATIONS_BUCKET)
+    .createSignedUrl(videoPath, REVEAL_VIDEO_SIGNED_URL_TTL_SECONDS);
+  if (error || typeof data?.signedUrl !== 'string' || !data.signedUrl.trim()) {
+    throw new StructuredError(
+      'animation_video_sign_failed',
+      'Temporary animation access could not be created.',
+      500,
+    );
+  }
+  return data.signedUrl;
 }
 
 /** Fast, non-atomic reuse check — mirrors characterize-drawing's "already done" fast path. */
@@ -1302,6 +1410,90 @@ Deno.serve(async (req) => {
 
   if (request.action === 'sweep' && !isSecretKeyRequest(req, supabaseSecretKey)) {
     return jsonResponse({ error: 'forbidden', message: 'sweep requires secret-key authorization.' }, 403);
+  }
+
+  if (request.action === 'reveal-status') {
+    try {
+      const response = await handleRevealStatus(request, {
+        verifyOwnership: (playerId, playerSecret) =>
+          verifyPlayerOwnership(admin, playerId, playerSecret),
+        findWinningSubmission: (gameId, roundId, playerId) =>
+          findWinningSubmissionForRoomMember(admin, gameId, roundId, playerId),
+        findExistingJob: (roundSubmissionId) =>
+          findExistingAnimationJob(admin, roundSubmissionId),
+        completeExisting: (job) =>
+          completeExistingAnimation(job, resolveVeoApiKey(), completionDependencies(admin)),
+        createSignedVideoUrl: (videoPath) =>
+          createRevealVideoSignedUrl(admin, videoPath),
+      });
+      console.log('[animate-winner] reveal_status_processed');
+      return response;
+    } catch (error) {
+      const structured = error instanceof StructuredError
+        ? error
+        : new StructuredError('unexpected_error', 'Reveal animation status failed unexpectedly.', 500);
+      if (!(error instanceof StructuredError)) console.error('[animate-winner] reveal status failed unexpectedly');
+      console.log('[animate-winner] reveal_status_failed', { code: structured.code });
+      return jsonResponse({ error: structured.code, message: structured.message }, structured.status);
+    }
+  }
+
+  if (request.action === 'request-rewarded-ad-correlation') {
+    try {
+      await verifyPlayerOwnership(admin, request.playerId, request.playerSecret);
+      const roundSubmissionId = await findWinningSubmissionForRoomMember(
+        admin,
+        request.gameId,
+        request.roundId,
+        request.playerId,
+      );
+      const winnerPlayerId = await findRoundWinnerPlayerId(admin, request.roundId);
+      const { token, expiresInSeconds } = await issueRewardedAdCorrelation(admin, {
+        gameId: request.gameId,
+        roundId: request.roundId,
+        roundSubmissionId,
+        winnerPlayerId,
+        requestedByPlayerId: request.playerId,
+      });
+      console.log('[animate-winner] rewarded_ad_correlation_issued');
+      return jsonResponse({ correlationToken: token, expiresInSeconds });
+    } catch (error) {
+      const structured = error instanceof StructuredError
+        ? error
+        : new StructuredError('unexpected_error', 'Rewarded ad correlation request failed unexpectedly.', 500);
+      if (!(error instanceof StructuredError)) {
+        console.error('[animate-winner] rewarded ad correlation failed unexpectedly');
+      }
+      console.log('[animate-winner] rewarded_ad_correlation_failed', { code: structured.code });
+      return jsonResponse({ error: structured.code, message: structured.message }, structured.status);
+    }
+  }
+
+  if (request.action === 'rewarded-ad-status') {
+    try {
+      await verifyPlayerOwnership(admin, request.playerId, request.playerSecret);
+      const roundSubmissionId = await findWinningSubmissionForRoomMember(
+        admin,
+        request.gameId,
+        request.roundId,
+        request.playerId,
+      );
+      const count = await countAvailableRewardedAdEntitlements(admin, roundSubmissionId);
+      console.log('[animate-winner] rewarded_ad_status_checked', { count });
+      // Deliberately minimal: no entitlement id, no transaction id, no
+      // timestamps. This action never touches animation_jobs and never
+      // starts anything -- it only answers "has SSV granted one yet?".
+      return jsonResponse({ verified: count > 0, count });
+    } catch (error) {
+      const structured = error instanceof StructuredError
+        ? error
+        : new StructuredError('unexpected_error', 'Rewarded ad status check failed unexpectedly.', 500);
+      if (!(error instanceof StructuredError)) {
+        console.error('[animate-winner] rewarded ad status check failed unexpectedly');
+      }
+      console.log('[animate-winner] rewarded_ad_status_failed', { code: structured.code });
+      return jsonResponse({ error: structured.code, message: structured.message }, structured.status);
+    }
   }
 
   if (request.action === 'status') {

@@ -4,6 +4,16 @@ import { track } from '@/services/analytics/analytics';
 import { uploadDrawingPng } from '@/services/drawing/drawingAssets';
 import type { CharacterizationResult } from '@/services/ai/characterization';
 import type { AnimationJobState, MotionName } from '@/services/ai/animation';
+import {
+  getWinnerAnimationRevealStatus as fetchWinnerAnimationRevealStatus,
+  type WinnerAnimationRevealResult,
+} from '@/services/ai/animation/WinnerAnimationService';
+import {
+  getRewardedAdCorrelation as fetchRewardedAdCorrelation,
+  getRewardedAdStatus as fetchRewardedAdStatus,
+  type RewardedAdCorrelationResult,
+  type RewardedAdStatusResult,
+} from '@/services/ads';
 import type { JudgeRoundResult } from '@/services/ai/judge';
 import { buildRound, FAKE_PLAYERS } from '@/services/game/fakeData';
 import { getGuestIdentity, rotateGuestIdentity, type GuestIdentity } from '@/services/game/guestIdentity';
@@ -210,6 +220,22 @@ export interface GameContextValue {
   reportJudgeResult: (result: JudgeRoundResult) => void;
   reportCharacterizations: (map: Partial<Record<PlayerId, CharacterizationResult>>) => void;
   reportAnimation: (animation: AnimationSnapshot) => void;
+  getWinnerAnimationRevealStatus: () => Promise<WinnerAnimationRevealResult>;
+  /**
+   * Requests a short-lived, single-use, server-issued opaque token for a
+   * rewarded ad's SSV correlation (see rewarded-ad-ssv/index.ts and the
+   * M4E migration). This is authorization PREPARATION only -- it never
+   * grants an entitlement itself; only a later, cryptographically verified
+   * Google SSV callback can do that.
+   */
+  getRewardedAdCorrelation: () => Promise<RewardedAdCorrelationResult>;
+  /**
+   * Read-only check for "has a verified Google SSV callback granted a
+   * rewarded_ad entitlement yet?". Never starts animation generation and
+   * never calls animate-winner's 'start' action -- see the M4E step 3
+   * report. Intended for a manual/bounded one-shot check, not polling.
+   */
+  getRewardedAdStatus: () => Promise<RewardedAdStatusResult>;
   nextRound: () => void | Promise<void>;
   endGame: () => void | Promise<void>;
   clearError: () => void;
@@ -320,6 +346,77 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     setIdentity(next);
     return next;
   }, []);
+
+  const getWinnerAnimationRevealStatus = useCallback(async (): Promise<WinnerAnimationRevealResult> => {
+    if (!remoteRoom?.currentRoundId) {
+      return {
+        state: 'error',
+        code: 'reveal_context_unavailable',
+        message: 'Winner animation status requires an active remote round.',
+        paidGenerationRequestsThisInvocation: 0,
+      };
+    }
+    if (!identity?.playerSecret) {
+      return {
+        state: 'error',
+        code: 'player_identity_unavailable',
+        message: 'Player authorization is unavailable.',
+        paidGenerationRequestsThisInvocation: 0,
+      };
+    }
+    return fetchWinnerAnimationRevealStatus({
+      gameId: remoteRoom.gameId,
+      roundId: remoteRoom.currentRoundId,
+      playerId: identity.playerId,
+      playerSecret: identity.playerSecret,
+    });
+  }, [identity, remoteRoom]);
+
+  const getRewardedAdCorrelation = useCallback(async (): Promise<RewardedAdCorrelationResult> => {
+    if (!remoteRoom?.currentRoundId) {
+      return {
+        status: 'error',
+        code: 'reveal_context_unavailable',
+        message: 'Rewarded ad correlation requires an active remote round.',
+      };
+    }
+    if (!identity?.playerSecret) {
+      return {
+        status: 'error',
+        code: 'player_identity_unavailable',
+        message: 'Player authorization is unavailable.',
+      };
+    }
+    return fetchRewardedAdCorrelation({
+      gameId: remoteRoom.gameId,
+      roundId: remoteRoom.currentRoundId,
+      playerId: identity.playerId,
+      playerSecret: identity.playerSecret,
+    });
+  }, [identity, remoteRoom]);
+
+  const getRewardedAdStatus = useCallback(async (): Promise<RewardedAdStatusResult> => {
+    if (!remoteRoom?.currentRoundId) {
+      return {
+        status: 'error',
+        code: 'reveal_context_unavailable',
+        message: 'Rewarded ad status requires an active remote round.',
+      };
+    }
+    if (!identity?.playerSecret) {
+      return {
+        status: 'error',
+        code: 'player_identity_unavailable',
+        message: 'Player authorization is unavailable.',
+      };
+    }
+    return fetchRewardedAdStatus({
+      gameId: remoteRoom.gameId,
+      roundId: remoteRoom.currentRoundId,
+      playerId: identity.playerId,
+      playerSecret: identity.playerSecret,
+    });
+  }, [identity, remoteRoom]);
 
   const value = useMemo<GameContextValue>(() => {
     const winner =
@@ -432,6 +529,9 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         dispatch({ type: 'CHARACTERIZE_DONE', map });
       },
       reportAnimation: (animation) => dispatch({ type: 'ANIMATION_UPDATE', animation }),
+      getWinnerAnimationRevealStatus,
+      getRewardedAdCorrelation,
+      getRewardedAdStatus,
       nextRound: async () => {
         const next = state.roundNumber + 1;
         track('next_round_pressed');
@@ -455,7 +555,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       },
       clearError: () => setError(null),
     };
-  }, [ensureIdentity, error, identity, isHost, loading, localDrawingUri, localPlayer, remoteRoom, runRemote, state]);
+  }, [ensureIdentity, error, getRewardedAdCorrelation, getRewardedAdStatus, getWinnerAnimationRevealStatus, identity, isHost, loading, localDrawingUri, localPlayer, remoteRoom, runRemote, state]);
 
   return <GameContext.Provider value={value}>{children}</GameContext.Provider>;
 }

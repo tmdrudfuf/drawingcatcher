@@ -15,7 +15,8 @@
         "backgroundColor": "#FBF9F5",
         "foregroundImage": "./assets/images/android-icon-foreground.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.tmdrudfuf.aisketchgame"
     },
     "web": {
       "output": "static",
@@ -29,6 +30,14 @@
           "backgroundColor": "#FBF9F5",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 96
+        }
+      ],
+      "expo-video",
+      [
+        "react-native-google-mobile-ads",
+        {
+          "androidAppId": "ca-app-pub-3940256099942544~3347511713",
+          "iosAppId": "ca-app-pub-3940256099942544~1458002511"
         }
       ]
     ],

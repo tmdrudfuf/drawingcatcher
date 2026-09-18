@@ -20,12 +20,20 @@ import {
   type CharacterizationInput,
   type CharacterizationResult,
 } from '@/services/ai/characterization';
+import { rewardedAdProvider, type RewardedAdResult, type RewardedAdSsvCorrelation } from '@/services/ads';
 import { track } from '@/services/analytics/analytics';
 import { publicCharacterizedUrl, resolveDrawingUri } from '@/services/drawing/drawingAssets';
 import { colors, radius } from '@/theme';
 import type { PlayerId } from '@/types/game';
 
 type Phase = 'working' | 'ready' | 'failed';
+type RevealStep = 'choice' | 'characterizing' | 'characterized';
+// M4E step 3: 'verifying'/'verified' extend the base show() outcomes with
+// the post-EARNED_REWARD SSV verification observation state
+// (ad_ready/idle -> requesting -> earned -> verifying -> verified). Google
+// SSV -- never this client -- is what actually grants the entitlement;
+// these two states only ever reflect a READ of that server-side outcome.
+type RewardedAdUiState = 'idle' | 'requesting' | RewardedAdResult['status'] | 'verifying' | 'verified';
 
 // AI providers (fake or real) must never trap the player. Each stage gets its
 // own bound so one slow/failed call can't stall the whole reveal, plus an
@@ -157,8 +165,26 @@ function CharacterReveal({ uri, width, height, label }: { uri: string; width: nu
 }
 
 export function RevealScreen() {
-  const { state, remoteRoom, isRemoteGame, localPlayerId, localDrawingUri, winner, reportCharacterizations, reportAnimation } =
-    useGame();
+  const {
+    state,
+    remoteRoom,
+    isRemoteGame,
+    localPlayerId,
+    localDrawingUri,
+    winner,
+    reportCharacterizations,
+    reportAnimation,
+    getRewardedAdCorrelation,
+    getRewardedAdStatus,
+  } = useGame();
+  const [revealStep, setRevealStep] = useState<RevealStep>('choice');
+  const [rewardedAdState, setRewardedAdState] = useState<RewardedAdUiState>('idle');
+  // Server-issued, single-use SSV correlation token (see rewardedAdCorrelation.ts
+  // and the M4E migration) -- fetched once per Reveal choice screen, BEFORE
+  // the ad is requested, and passed to both prepare() and show() so
+  // GoogleRewardedAdProvider's correlation-keyed session isn't thrown away
+  // between the two calls (it keys the prepared ad on this exact value).
+  const [adCorrelation, setAdCorrelation] = useState<RewardedAdSsvCorrelation | undefined>(undefined);
   const [phase, setPhase] = useState<Phase>('working');
   const [motions, setMotions] = useState<MotionName[]>([]);
   const [replayKey, setReplayKey] = useState(0);
@@ -166,16 +192,74 @@ export function RevealScreen() {
   const [heroBox, setHeroBox] = useState({ width: 0, height: 0 });
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const startedRef = useRef(false);
+  const choiceViewedRef = useRef(false);
+  const mountedRef = useRef(true);
+  // Guards the ad-correlation fetch below to run at most once per round --
+  // see that effect's comment for why depending on getRewardedAdCorrelation
+  // itself would be wrong.
+  const adCorrelationRoundRef = useRef<string | null>(null);
+  // Holds the ONE bounded delayed-verification timer (never a polling
+  // interval) scheduled after EARNED_REWARD -- see checkRewardedAdVerification.
+  const verificationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (remoteRoom?.status === 'ended') router.replace('/');
   }, [remoteRoom?.status]);
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    if (verificationTimerRef.current) clearTimeout(verificationTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!winner || choiceViewedRef.current) return;
+    choiceViewedRef.current = true;
+    track('bring_to_life_choice_viewed');
+  }, [winner]);
+
+  useEffect(() => {
+    if (revealStep !== 'choice') return;
+    // getRewardedAdCorrelation is a useCallback keyed on [identity,
+    // remoteRoom], and remoteRoom is a NEW object on every realtime
+    // snapshot (same caveat the animation effect below documents at length
+    // for judgeResult/winner). Depending on the callback's identity here
+    // would re-mint a correlation -- and reload the ad from scratch via
+    // prepare()'s correlationKey change -- on every snapshot while a player
+    // sits on this screen. Guard on the round instead: a round has exactly
+    // one winner/winning submission, so one correlation per round is
+    // correct and sufficient.
+    const roundKey = remoteRoom?.currentRoundId ?? null;
+    if (adCorrelationRoundRef.current === roundKey) return;
+    adCorrelationRoundRef.current = roundKey;
+
+    let cancelled = false;
+    (async () => {
+      // Fetch the opaque SSV correlation BEFORE the ad is prepared/shown --
+      // never trust a client-side EARNED_REWARD event as authorization (see
+      // rewardedAdCorrelation.ts and the M4E migration). The same
+      // correlation object is passed to both prepare() and show() below:
+      // GoogleRewardedAdProvider keys its in-flight prepared ad on this
+      // exact value, so passing it only at show() would key-mismatch,
+      // discard the already-loading ad, and reload from scratch.
+      const result = await getRewardedAdCorrelation();
+      if (cancelled) return;
+      const correlation: RewardedAdSsvCorrelation | undefined =
+        result.status === 'ready' ? { opaqueCustomData: result.token } : undefined;
+      setAdCorrelation(correlation);
+      void rewardedAdProvider.prepare(correlation);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealStep, remoteRoom?.currentRoundId]);
 
   useEffect(() => {
     if (!state.judgeResult || !winner) {
       router.replace('/');
       return;
     }
+    if (revealStep !== 'characterizing') return;
     if (startedRef.current) return;
     startedRef.current = true;
 
@@ -192,6 +276,7 @@ export function RevealScreen() {
       reportAnimation({ state: 'failed', motions: [] });
       track('generation_failed', { stage, reason });
       setPhase('failed');
+      setRevealStep('characterized');
     };
 
     // Belt-and-suspenders: even an unforeseen hang in either fake provider must
@@ -273,6 +358,7 @@ export function RevealScreen() {
             if (safetyId) clearTimeout(safetyId);
             setMotions(status.result.motions);
             setPhase('ready');
+            setRevealStep('characterized');
             reportAnimation({ state: 'completed', motions: status.result.motions });
             if (__DEV__) console.log('[animation] completed');
             track('animation_completed');
@@ -302,9 +388,140 @@ export function RevealScreen() {
     // on "working" forever. round/winner identity is stable for the life of a
     // single reveal, so that's what this effect actually needs to react to.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.roundNumber, winner?.id]);
+  }, [revealStep, state.roundNumber, winner?.id]);
 
   if (!winner) return <Screen />;
+
+  const chooseCharacterize = () => {
+    track('bring_to_life_characterize_selected');
+    setRevealStep('characterizing');
+  };
+
+  // EARNED_REWARD is NEVER authoritative -- see RewardedAdProvider.ts and
+  // the M4E migration. This only READS whether Google's SSV callback has
+  // already verified and granted a rewarded_ad entitlement server-side; it
+  // never inserts one, never calls a grant RPC, and never calls
+  // animate-winner's 'start' action. One call per invocation, no loop.
+  const checkRewardedAdVerification = async () => {
+    if (!mountedRef.current) return;
+    setRewardedAdState('verifying');
+    const result = await getRewardedAdStatus();
+    if (!mountedRef.current) return;
+    setRewardedAdState(result.status === 'checked' && result.verified ? 'verified' : 'earned');
+  };
+
+  const showRewardedAd = async () => {
+    if (rewardedAdState === 'requesting' || rewardedAdState === 'earned' || rewardedAdState === 'verifying' || rewardedAdState === 'verified') {
+      return;
+    }
+    track('bring_to_life_animate_selected');
+    setRewardedAdState('requesting');
+    const result = await rewardedAdProvider.show(adCorrelation);
+    if (!mountedRef.current) return;
+    setRewardedAdState(result.status);
+    if (result.status === 'earned') {
+      // ONE bounded delayed check, not a polling loop: Google's real SSV
+      // callback typically lands within a few seconds of EARNED_REWARD.
+      // The "CHECK STATUS" button below covers a slower callback without
+      // this ever repeating on its own.
+      verificationTimerRef.current = setTimeout(() => void checkRewardedAdVerification(), 6000);
+    }
+  };
+
+  if (revealStep === 'choice') {
+    return (
+      <Screen>
+        <Text style={{ fontSize: 17, fontWeight: '800', textTransform: 'uppercase', color: colors.ink }}>
+          Bring Them to Life
+        </Text>
+        <Text style={{ textAlign: 'center', fontSize: 26, fontWeight: '900', color: colors.coralInk }}>
+          What should happen to this wonderfully weird winner?
+        </Text>
+
+        <View style={{ gap: 12 }}>
+          <View
+            style={{
+              gap: 10,
+              padding: 16,
+              borderWidth: 2,
+              borderColor: colors.coral,
+              borderRadius: radius.lg,
+              backgroundColor: colors.coralTint,
+            }}
+          >
+            <Pill label="FREE" tone="green" />
+            <Text style={{ fontSize: 22, fontWeight: '900', color: colors.ink }}>Characterize</Text>
+            <Text style={{ fontSize: 15, lineHeight: 21, color: colors.sub }}>
+              Turn the winning sketch into an AI character while keeping all its weird proportions.
+            </Text>
+            <Button label="CHARACTERIZE" size="lg" onPress={chooseCharacterize} />
+          </View>
+
+          <View
+            style={{
+              gap: 10,
+              padding: 16,
+              borderWidth: 2,
+              borderColor: '#E7C568',
+              borderRadius: radius.lg,
+              backgroundColor: colors.yellowTint,
+            }}
+          >
+            <Pill label="ANIMATED" tone="yellow" />
+            <Text style={{ fontSize: 22, fontWeight: '900', color: colors.ink }}>Animate</Text>
+            <Text style={{ fontSize: 15, lineHeight: 21, color: colors.sub }}>
+              Watch an ad to turn the character into a short animation shared with both players.
+            </Text>
+            <Button
+              label="WATCH AD & ANIMATE"
+              variant="ghost"
+              size="lg"
+              disabled={
+                rewardedAdState === 'requesting' ||
+                rewardedAdState === 'earned' ||
+                rewardedAdState === 'verifying' ||
+                rewardedAdState === 'verified'
+              }
+              onPress={() => void showRewardedAd()}
+            />
+            {rewardedAdState === 'requesting' ? (
+              <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>Opening Google’s test ad…</Text>
+            ) : rewardedAdState === 'earned' ? (
+              <>
+                <Text style={{ fontSize: 14, lineHeight: 20, color: colors.green }}>
+                  Reward received — verifying… No animation request was made.
+                </Text>
+                <Button label="CHECK STATUS" variant="link" onPress={() => void checkRewardedAdVerification()} />
+              </>
+            ) : rewardedAdState === 'verifying' ? (
+              <Text style={{ fontSize: 14, lineHeight: 20, color: colors.green }}>
+                Checking with the ad network…
+              </Text>
+            ) : rewardedAdState === 'verified' ? (
+              <Text style={{ fontSize: 14, lineHeight: 20, color: colors.green }}>
+                Verified — animation unlock is ready. No animation request was made yet.
+              </Text>
+            ) : rewardedAdState === 'closed_without_reward' ? (
+              <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>
+                No reward was earned. You can try again, Characterize, or continue.
+              </Text>
+            ) : rewardedAdState === 'unavailable' ? (
+              <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>
+                Rewarded ads are unavailable here. Use a development build, or choose Characterize instead.
+              </Text>
+            ) : rewardedAdState === 'error' ? (
+              <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>
+                The test ad could not be shown. Characterize and Continue are still available.
+              </Text>
+            ) : null}
+          </View>
+        </View>
+
+        <View style={{ flex: 1 }} />
+        <Button label="CONTINUE WITHOUT EFFECT" variant="link" onPress={() => router.replace('/next-round')} />
+      </Screen>
+    );
+  }
 
   const v = winner.drawing.sketchVariant;
   const working = phase === 'working';
@@ -392,7 +609,7 @@ export function RevealScreen() {
       {working ? (
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', gap: 16 }}>
           <MotionCat variant={v} size={150} motions={['bounce']} />
-          <Text style={{ fontSize: 15, color: colors.sub }}>Bringing your drawings to life…</Text>
+          <Text style={{ fontSize: 15, color: colors.sub }}>Bringing your drawing to life…</Text>
         </View>
       ) : (
         <>

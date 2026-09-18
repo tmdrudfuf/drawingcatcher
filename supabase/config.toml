@@ -1,0 +1,10 @@
+# Only rewarded-ad-ssv needs an entry here. It is a public, unauthenticated
+# GET webhook that Google's AdMob servers call directly with no apikey and
+# no Authorization header -- the gateway's default JWT/apikey check would
+# reject every real callback with a 401 before the function's own ECDSA
+# signature verification ever runs. Every other function (animate-winner,
+# characterize-drawing, judge-round, veo-api-probe) is client-invoked with a
+# valid apikey and is unaffected by this file, so it is left with the
+# platform default (verify_jwt = true) by simply not being listed here.
+[functions.rewarded-ad-ssv]
+verify_jwt = false
