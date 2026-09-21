@@ -1,13 +1,17 @@
 import { supabase, supabaseConfigError } from '@/providers/supabase/supabase';
-import type {
-  CharacterizationInput,
-  CharacterizationProvider,
-  CharacterizationResult,
+import {
+  isCharacterizationStyle,
+  type CharacterizationInput,
+  type CharacterizationProvider,
+  type CharacterizationResult,
+  type CharacterizationStyle,
 } from './CharacterizationProvider';
 
 interface CharacterizeDrawingResponse {
   characterizedPath?: string;
   reused?: boolean;
+  /** Milestone 4F: null for a pre-V2 row, a style key for anything V2+. */
+  style?: CharacterizationStyle | string | null;
   error?: string;
   message?: string;
 }
@@ -36,12 +40,22 @@ export class GeminiCharacterizationProvider implements CharacterizationProvider 
       throw new Error(data?.message ?? data?.error ?? 'Gemini characterization returned no image.');
     }
 
+    // Milestone 4F: the server is the sole authority on style (see
+    // selectStyle() in characterize-drawing/index.ts) — this only reads
+    // back and validates what it returned. A pre-V2 row legitimately
+    // reports style: null; an unrecognized value is treated the same as
+    // null rather than trusted, since this client never chose or verified it.
+    const style = isCharacterizationStyle(data.style) ? data.style : null;
+
     return {
       sourceSketchVariant: input.drawing.sketchVariant,
       characterAsset: input.drawing.sketchVariant,
       preservedTraits: input.drawing.traits,
-      styleNote: 'Gemini 3.1 Flash Image — preserve first, stylize second',
+      styleNote: style
+        ? `Gemini 3.1 Flash Image — ${style} style — preserve first, stylize second`
+        : 'Gemini 3.1 Flash Image — preserve first, stylize second',
       characterizedImagePath: data.characterizedPath,
+      style,
     };
   }
 }

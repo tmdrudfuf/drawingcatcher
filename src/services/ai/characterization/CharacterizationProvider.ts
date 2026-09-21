@@ -6,6 +6,33 @@ export interface CharacterizationContext {
   playerId: string;
 }
 
+/**
+ * Characterization V2 (Milestone 4F). Mirrors
+ * supabase/functions/characterize-drawing/prompt.ts's STYLE_KEYS exactly —
+ * duplicated here (not imported) because the client and the Deno edge
+ * function are separate module-resolution contexts, same reason
+ * src/services/ads/admobConfig.ts's constants are duplicated into
+ * app.config.ts rather than imported. The server is the sole source of
+ * truth for VALUE selection (see selectStyle() there); this is only the
+ * shape of what it may return.
+ */
+export const CHARACTERIZATION_STYLES = [
+  'cute',
+  'funny',
+  'epic',
+  'chibi',
+  'realistic',
+  'anime',
+  'pixel_art',
+  'crayon',
+] as const;
+
+export type CharacterizationStyle = (typeof CHARACTERIZATION_STYLES)[number];
+
+export function isCharacterizationStyle(value: unknown): value is CharacterizationStyle {
+  return typeof value === 'string' && (CHARACTERIZATION_STYLES as readonly string[]).includes(value);
+}
+
 export interface CharacterizationInput {
   prompt: string;
   drawing: PlayerDrawing;
@@ -32,6 +59,15 @@ export interface CharacterizationResult {
    * interface — screens can render `characterAsset` instead).
    */
   characterizedImagePath?: string | null;
+  /**
+   * Milestone 4F (Characterization V2): the server-selected style this
+   * image was (or, for a pre-V2 row, was NOT) generated with. The server
+   * is the sole authority — this is exposed here as structured data for
+   * future UI/analytics, not built into any UI yet. Null for a pre-V2
+   * completed characterization (no style was ever persisted for it) or a
+   * fake/local result; that is a normal, expected value, not an error.
+   */
+  style?: CharacterizationStyle | null;
 }
 
 /**

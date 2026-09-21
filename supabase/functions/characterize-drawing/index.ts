@@ -25,7 +25,12 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { decodeBase64, encodeBase64 } from 'https://deno.land/std@0.224.0/encoding/base64.ts';
 
-import { buildCharacterizationPrompt } from './prompt.ts';
+import {
+  buildCharacterizationPrompt,
+  CURRENT_PROMPT_VERSION,
+  selectStyle,
+  type CharacterizationStyle,
+} from './prompt.ts';
 
 const DRAWINGS_BUCKET = 'drawings';
 const CHARACTERIZED_BUCKET = 'characterized';
@@ -175,7 +180,11 @@ async function callGemini(apiKey: string, promptText: string, imageBase64: strin
     const json = await res.json();
     const parts: Array<Record<string, unknown>> = json?.candidates?.[0]?.content?.parts ?? [];
     for (const part of parts) {
-      const inline = part.inlineData ?? part.inline_data;
+      // Pre-existing latent `deno check` type error (unrelated to V2),
+      // fixed here only because it blocked this task's required check —
+      // no runtime behavior change: `unknown ?? unknown` narrows to `{}`
+      // under strict null checks, which has no `.data` property to read.
+      const inline = (part.inlineData ?? part.inline_data) as { data?: string } | undefined;
       if (inline?.data) return inline.data as string;
     }
     throw new Error('gemini_no_image_returned');
@@ -193,15 +202,34 @@ async function callGemini(apiKey: string, promptText: string, imageBase64: strin
  * nothing new exposed to anonymous clients (this runs on the service-role
  * client only). Claimable when: never attempted ('pending'), a previous
  * attempt failed, or a 'generating' row has gone stale.
+ *
+ * V2: the same UPDATE also persists the already-computed style and the
+ * current prompt version — this is additive to the existing SET clause, not
+ * a second statement, so it introduces no new race window. Re-setting these
+ * on a stale reclaim is harmless: selectStyle() is pure, so it recomputes
+ * the identical style every time, and a reclaim always uses the CURRENT
+ * prompt version (the abandoned attempt never produced an image, so there
+ * is no "original version" to preserve).
  */
 // deno-lint-ignore no-explicit-any
-async function attemptClaim(admin: any, roundId: string, playerId: string): Promise<boolean> {
+async function attemptClaim(
+  admin: any,
+  roundId: string,
+  playerId: string,
+  style: CharacterizationStyle,
+): Promise<boolean> {
   const nowIso = new Date().toISOString();
   const staleBeforeIso = new Date(Date.now() - STALE_GENERATING_MS).toISOString();
 
   const { data, error } = await admin
     .from('round_submissions')
-    .update({ characterization_status: 'generating', characterization_started_at: nowIso, characterization_error: null })
+    .update({
+      characterization_status: 'generating',
+      characterization_started_at: nowIso,
+      characterization_error: null,
+      characterization_style: style,
+      characterization_prompt_version: CURRENT_PROMPT_VERSION,
+    })
     .eq('round_id', roundId)
     .eq('player_id', playerId)
     .is('characterized_path', null)
@@ -216,7 +244,7 @@ async function attemptClaim(admin: any, roundId: string, playerId: string): Prom
 }
 
 type PollOutcome =
-  | { outcome: 'completed'; path: string }
+  | { outcome: 'completed'; path: string; style: CharacterizationStyle | null }
   | { outcome: 'failed'; message: string }
   | { outcome: 'timeout' };
 
@@ -228,12 +256,14 @@ async function pollForResult(admin: any, roundId: string, playerId: string): Pro
     await sleep(POLL_INTERVAL_MS);
     const { data, error } = await admin
       .from('round_submissions')
-      .select('characterized_path, characterization_status, characterization_error')
+      .select('characterized_path, characterization_status, characterization_error, characterization_style')
       .eq('round_id', roundId)
       .eq('player_id', playerId)
       .maybeSingle();
     if (error) continue; // transient read error — retry within the same bounded window
-    if (data?.characterized_path) return { outcome: 'completed', path: data.characterized_path };
+    if (data?.characterized_path) {
+      return { outcome: 'completed', path: data.characterized_path, style: data.characterization_style ?? null };
+    }
     if (data?.characterization_status === 'failed') {
       return { outcome: 'failed', message: data.characterization_error ?? 'Generation failed.' };
     }
@@ -296,7 +326,7 @@ Deno.serve(async (req) => {
 
   const { data: submission, error: subError } = await admin
     .from('round_submissions')
-    .select('drawing_path, characterized_path, characterization_status')
+    .select('id, drawing_path, characterized_path, characterization_status, characterization_style')
     .eq('round_id', roundId)
     .eq('player_id', playerId)
     .maybeSingle();
@@ -306,10 +336,17 @@ Deno.serve(async (req) => {
   }
 
   // Fast path: already done (a prior generation, by either device). No claim
-  // attempt, no Gemini call.
+  // attempt, no Gemini call. Returns the PERSISTED style as-is — including
+  // null for a pre-V2 row generated before this column existed. A null
+  // style here must never be treated as "needs regeneration"; this fast
+  // path returns immediately regardless of style.
   if (submission.characterized_path) {
     console.log('[characterize-drawing] characterization_existing', { gameId, roundId, playerId });
-    return jsonResponse({ characterizedPath: submission.characterized_path, reused: true });
+    return jsonResponse({
+      characterizedPath: submission.characterized_path,
+      reused: true,
+      style: submission.characterization_style ?? null,
+    });
   }
 
   if (!submission.drawing_path) {
@@ -319,9 +356,13 @@ Deno.serve(async (req) => {
     );
   }
 
+  // V2: computed once, from the immutable submission id, before the claim
+  // race — see selectStyle()'s doc comment for why this needs no locking.
+  const style = selectStyle(submission.id);
+
   let claimed: boolean;
   try {
-    claimed = await attemptClaim(admin, roundId, playerId);
+    claimed = await attemptClaim(admin, roundId, playerId, style);
   } catch (err) {
     const structured = err instanceof StructuredError ? err : new StructuredError('db_error', 'Claim failed.', 500);
     return jsonResponse({ error: structured.code, message: structured.message }, structured.status);
@@ -335,7 +376,7 @@ Deno.serve(async (req) => {
 
     if (result.outcome === 'completed') {
       console.log('[characterize-drawing] characterization_reused', { gameId, roundId, playerId });
-      return jsonResponse({ characterizedPath: result.path, reused: true });
+      return jsonResponse({ characterizedPath: result.path, reused: true, style: result.style });
     }
     if (result.outcome === 'failed') {
       console.log('[characterize-drawing] characterization_failed', { gameId, roundId, playerId, via: 'other-request' });
@@ -367,7 +408,7 @@ Deno.serve(async (req) => {
     }
 
     const drawingBase64 = encodeBase64(new Uint8Array(await drawingBlob.arrayBuffer()));
-    const promptText = buildCharacterizationPrompt(prompt);
+    const promptText = buildCharacterizationPrompt(prompt, style);
 
     let generatedBase64: string;
     try {
@@ -411,8 +452,9 @@ Deno.serve(async (req) => {
       roundId,
       playerId,
       durationMs: Date.now() - startedAt,
+      style,
     });
-    return jsonResponse({ characterizedPath: outputPath, reused: false });
+    return jsonResponse({ characterizedPath: outputPath, reused: false, style });
   } catch (err) {
     const structured =
       err instanceof StructuredError ? err : new StructuredError('unexpected_error', String(err), 500);

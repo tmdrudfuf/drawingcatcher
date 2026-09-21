@@ -19,9 +19,12 @@ class CharacterizationRouter implements CharacterizationProvider {
 
 export const characterizationService: CharacterizationProvider = new CharacterizationRouter();
 
-export type {
-  CharacterizationContext,
-  CharacterizationInput,
-  CharacterizationProvider,
-  CharacterizationResult,
+export {
+  CHARACTERIZATION_STYLES,
+  isCharacterizationStyle,
+  type CharacterizationContext,
+  type CharacterizationInput,
+  type CharacterizationProvider,
+  type CharacterizationResult,
+  type CharacterizationStyle,
 } from './CharacterizationProvider';
