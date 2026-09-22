@@ -135,3 +135,64 @@ export async function getWinnerAnimationRevealStatus(
     return errorResult('request_failed', 'Winner animation status request failed.');
   }
 }
+
+/**
+ * M4E step 4: the explicit "GENERATE ANIMATION" action. This is the ONLY
+ * client call site for animate-winner's 'start' action -- it reuses the
+ * existing M4C start path entirely (player credential verification, game
+ * membership, winner/winning-submission derivation, entitlement
+ * validation/consumption, job creation/reuse, the atomic one-shot paid-Veo
+ * claim) rather than adding any new server endpoint. The server derives the
+ * winner and its winning submission itself from (gameId, roundId, playerId)
+ * -- this function has no submission-id parameter, so there is no channel
+ * for a caller to choose or override which submission gets animated.
+ */
+export type WinnerAnimationStartResult =
+  | { state: 'started'; jobId: string; jobStatus: string; paidGenerationRequestedThisCall: boolean }
+  | { state: 'error'; code: string; message: string };
+
+export function parseWinnerAnimationStartResponse(value: unknown): WinnerAnimationStartResult {
+  if (!isRecord(value)) {
+    return { state: 'error', code: 'invalid_response', message: 'Animation could not be started.' };
+  }
+  if (nonEmptyString(value.error)) {
+    return {
+      state: 'error',
+      code: value.error,
+      message: nonEmptyString(value.message) ? value.message : 'Animation could not be started.',
+    };
+  }
+  if (value.verified !== true || !nonEmptyString(value.jobId) || !nonEmptyString(value.jobStatus)) {
+    return { state: 'error', code: 'invalid_response', message: 'Animation start returned an incomplete response.' };
+  }
+  return {
+    state: 'started',
+    jobId: value.jobId,
+    jobStatus: value.jobStatus,
+    paidGenerationRequestedThisCall: value.paidGenerationRequestsThisInvocation === 1,
+  };
+}
+
+export async function startWinnerAnimation(
+  input: WinnerAnimationRevealStatusInput,
+): Promise<WinnerAnimationStartResult> {
+  if (!supabase) {
+    return { state: 'error', code: 'client_not_configured', message: supabaseConfigError ?? 'Supabase is not available.' };
+  }
+
+  try {
+    const { data, error } = await supabase.functions.invoke<unknown>('animate-winner', {
+      body: {
+        action: 'start',
+        gameId: input.gameId,
+        roundId: input.roundId,
+        playerId: input.playerId,
+        playerSecret: input.playerSecret,
+      },
+    });
+    if (error) return { state: 'error', code: 'request_failed', message: 'Animation could not be started.' };
+    return parseWinnerAnimationStartResponse(data);
+  } catch {
+    return { state: 'error', code: 'request_failed', message: 'Animation start request failed.' };
+  }
+}

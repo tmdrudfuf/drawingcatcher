@@ -1,7 +1,6 @@
 import type { RealtimeChannel } from '@supabase/supabase-js';
 
 import { supabase, supabaseConfigError } from '@/providers/supabase/supabase';
-import { FAKE_PROMPTS } from '@/services/game/fakeData';
 import type { Player, RoundPhase, SketchVariant } from '@/types/game';
 
 type GameStatus = 'waiting' | 'active' | 'ended';
@@ -301,12 +300,19 @@ export async function setReady(gameId: string, playerId: string, ready: boolean)
   if (error) throw new Error(error.message);
 }
 
+/**
+ * Milestone 4G: the prompt is no longer supplied here — start_round_if_ready
+ * selects one itself, authoritatively, from public.drawing_prompts (server
+ * random selection, same RPC-is-authoritative pattern as every other
+ * shared game-state decision in this file). This function only tells the
+ * server "the host wants to start"; the actual round-1 prompt only
+ * becomes known once the realtime rounds snapshot arrives.
+ */
 export async function startRoundIfReady(gameId: string, hostPlayerId: string): Promise<void> {
   const client = requireClient();
   const { error } = await client.rpc('start_round_if_ready', {
     p_game_id: gameId,
     p_actor_player_id: hostPlayerId,
-    p_prompt: FAKE_PROMPTS[0],
   });
   if (error) throw new Error(error.message);
 }
@@ -348,12 +354,17 @@ export async function markReveal(roundId: string): Promise<void> {
   if (error) throw new Error(error.message);
 }
 
+/**
+ * Milestone 4G: same change as startRoundIfReady above — the next prompt
+ * is selected authoritatively by request_next_round itself (random,
+ * avoiding an immediate repeat of the ending round's prompt), never
+ * supplied by either client.
+ */
 export async function requestNextRound(gameId: string, playerId: string): Promise<void> {
   const client = requireClient();
   const { error } = await client.rpc('request_next_round', {
     p_game_id: gameId,
     p_player_id: playerId,
-    p_prompts: FAKE_PROMPTS,
   });
   if (error) throw new Error(error.message);
 }

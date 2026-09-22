@@ -6,7 +6,9 @@ import type { CharacterizationResult } from '@/services/ai/characterization';
 import type { AnimationJobState, MotionName } from '@/services/ai/animation';
 import {
   getWinnerAnimationRevealStatus as fetchWinnerAnimationRevealStatus,
+  startWinnerAnimation as callStartWinnerAnimation,
   type WinnerAnimationRevealResult,
+  type WinnerAnimationStartResult,
 } from '@/services/ai/animation/WinnerAnimationService';
 import {
   getRewardedAdCorrelation as fetchRewardedAdCorrelation,
@@ -222,6 +224,15 @@ export interface GameContextValue {
   reportAnimation: (animation: AnimationSnapshot) => void;
   getWinnerAnimationRevealStatus: () => Promise<WinnerAnimationRevealResult>;
   /**
+   * M4E step 4: the ONLY client entry point that may call animate-winner's
+   * 'start' action. Requires an explicit user press -- never call this
+   * automatically from an entitlement/verification state change. The
+   * server re-derives and re-validates everything (ownership, membership,
+   * winner, winning submission, entitlement, one-shot paid claim); this
+   * only forwards the caller's own identity, never a submission id.
+   */
+  startWinnerAnimation: () => Promise<WinnerAnimationStartResult>;
+  /**
    * Requests a short-lived, single-use, server-issued opaque token for a
    * rewarded ad's SSV correlation (see rewarded-ad-ssv/index.ts and the
    * M4E migration). This is authorization PREPARATION only -- it never
@@ -258,15 +269,25 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
 
   // Remote round-lifecycle analytics + per-round local asset reset. The realtime
   // snapshot is authoritative for when a round actually begins.
+  //
+  // Milestone 4G: includes the round's server-selected prompt. Safe to send
+  // as-is — it's shown on-screen to both players already, never secret —
+  // and lets later analysis correlate specific prompts with completion /
+  // Bring Them to Life / Round 2 start rates. remoteRoom.prompt is already
+  // synced in by this same snapshot, so no extra read is needed.
   useEffect(() => {
     const n = remoteRoom?.currentRoundNumber ?? 0;
     if (n > prevRoundRef.current && n >= 1) {
-      track('round_started', { round: n });
+      track('round_started', { round: n, prompt: remoteRoom?.prompt ?? null });
       if (n === 2) track('round_2_started');
       if (prevRoundRef.current >= 1) setLocalDrawingUri(null);
     }
     prevRoundRef.current = n;
-  }, [remoteRoom?.currentRoundNumber]);
+    // remoteRoom.prompt only ever changes in lockstep with
+    // currentRoundNumber (both come from the same snapshot, updated when a
+    // new round is created) -- listed as a primitive dep, same as
+    // currentRoundNumber itself, never the whole remoteRoom object.
+  }, [remoteRoom?.currentRoundNumber, remoteRoom?.prompt]);
 
   useEffect(() => {
     if (!remoteRoom?.gameId) return;
@@ -365,6 +386,29 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       };
     }
     return fetchWinnerAnimationRevealStatus({
+      gameId: remoteRoom.gameId,
+      roundId: remoteRoom.currentRoundId,
+      playerId: identity.playerId,
+      playerSecret: identity.playerSecret,
+    });
+  }, [identity, remoteRoom]);
+
+  const startWinnerAnimation = useCallback(async (): Promise<WinnerAnimationStartResult> => {
+    if (!remoteRoom?.currentRoundId) {
+      return {
+        state: 'error',
+        code: 'reveal_context_unavailable',
+        message: 'Starting the animation requires an active remote round.',
+      };
+    }
+    if (!identity?.playerSecret) {
+      return {
+        state: 'error',
+        code: 'player_identity_unavailable',
+        message: 'Player authorization is unavailable.',
+      };
+    }
+    return callStartWinnerAnimation({
       gameId: remoteRoom.gameId,
       roundId: remoteRoom.currentRoundId,
       playerId: identity.playerId,
@@ -530,6 +574,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       },
       reportAnimation: (animation) => dispatch({ type: 'ANIMATION_UPDATE', animation }),
       getWinnerAnimationRevealStatus,
+      startWinnerAnimation,
       getRewardedAdCorrelation,
       getRewardedAdStatus,
       nextRound: async () => {
@@ -555,7 +600,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       },
       clearError: () => setError(null),
     };
-  }, [ensureIdentity, error, getRewardedAdCorrelation, getRewardedAdStatus, getWinnerAnimationRevealStatus, identity, isHost, loading, localDrawingUri, localPlayer, remoteRoom, runRemote, state]);
+  }, [ensureIdentity, error, getRewardedAdCorrelation, getRewardedAdStatus, getWinnerAnimationRevealStatus, identity, isHost, loading, localDrawingUri, localPlayer, remoteRoom, runRemote, startWinnerAnimation, state]);
 
   return <GameContext.Provider value={value}>{children}</GameContext.Provider>;
 }

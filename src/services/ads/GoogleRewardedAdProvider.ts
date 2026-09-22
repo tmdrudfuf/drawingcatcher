@@ -11,7 +11,13 @@ import type {
 } from './RewardedAdProvider';
 
 interface RewardedAdHandle {
-  addAdEventListener(event: string, listener: () => void): () => void;
+  // `payload` is `unknown`, not `void`, because the real SDK's ERROR event
+  // (react-native-google-mobile-ads' AdEventType.ERROR) DOES call this
+  // listener with a NativeError payload ({ code, message, userInfo: { code,
+  // domain, message } }) -- the previous `() => void` signature type-erased
+  // that argument, which is the reason a failed ad's real error was always
+  // logged as `{}` (see sanitizeAdErrorForLogging below).
+  addAdEventListener(event: string, listener: (payload?: unknown) => void): () => void;
   load(): void;
   show(): Promise<void>;
 }
@@ -42,6 +48,45 @@ interface PreparedAd {
   loadPromise: Promise<RewardedAdPreparationResult>;
   resolveShow?: (result: RewardedAdResult) => void;
   unsubscribe: (() => void)[];
+}
+
+/**
+ * Development-only diagnostics (see analytics.ts's track(), which already
+ * gates every call on __DEV__ -- this never adds its own release-build
+ * logging). Extracts ONLY a fixed allowlist of non-secret fields from
+ * whatever the SDK/JS runtime threw or emitted: the library's own error
+ * code/message, plus -- when the payload is react-native-google-mobile-ads'
+ * NativeError shape -- the underlying native/provider error code and
+ * domain (see node_modules/react-native-google-mobile-ads/.../NativeError.js:
+ * `{ code, message, userInfo: { code, domain, message } }`).
+ *
+ * Deliberately does NOT spread/forward the whole error or its `userInfo`
+ * object, so nothing outside this exact allowlist can ever reach the log,
+ * even if some future payload shape carried something else in an
+ * unexpected field. AdMob ad-load/show error payloads never contain
+ * playerSecret, Supabase secrets, SSV correlation/customData, API keys, or
+ * auth tokens -- none of that data ever flows through this SDK -- but the
+ * allowlist means that stays true by construction, not by inspection.
+ */
+function sanitizeAdErrorForLogging(error: unknown): Record<string, unknown> {
+  if (!error || typeof error !== 'object') {
+    return { message: typeof error === 'string' ? error : String(error) };
+  }
+  const record = error as Record<string, unknown>;
+  const userInfo =
+    record.userInfo && typeof record.userInfo === 'object' ? (record.userInfo as Record<string, unknown>) : undefined;
+
+  const result: Record<string, unknown> = {};
+  if (typeof record.code === 'string' || typeof record.code === 'number') result.code = record.code;
+  if (typeof record.message === 'string') result.message = record.message;
+  if (userInfo) {
+    if (typeof userInfo.code === 'string' || typeof userInfo.code === 'number') result.nativeErrorCode = userInfo.code;
+    if (typeof userInfo.domain === 'string') result.domain = userInfo.domain;
+    // userInfo.message is usually a duplicate/more-specific form of
+    // record.message; include it only when the top-level one is absent.
+    if (result.message === undefined && typeof userInfo.message === 'string') result.message = userInfo.message;
+  }
+  return result;
 }
 
 function correlationKey(correlation?: RewardedAdSsvCorrelation): string {
@@ -143,9 +188,9 @@ export class GoogleRewardedAdProvider implements RewardedAdProvider {
           track('rewarded_ad_loaded');
           resolveLoad({ status: 'ready' });
         }),
-        ad.addAdEventListener(sdk.events.error, () => {
+        ad.addAdEventListener(sdk.events.error, (error) => {
           session.failed = true;
-          track('rewarded_ad_failed');
+          track('rewarded_ad_failed', sanitizeAdErrorForLogging(error));
           resolveLoad({ status: 'error' });
           this.finishSession(session, { status: 'error', message: 'The rewarded ad could not be loaded.' });
         }),
@@ -165,10 +210,10 @@ export class GoogleRewardedAdProvider implements RewardedAdProvider {
       this.prepared = session;
       ad.load();
       return session.loadPromise;
-    } catch {
+    } catch (error) {
       this.sdkPromise = null;
       this.disposePrepared();
-      track('rewarded_ad_failed');
+      track('rewarded_ad_failed', sanitizeAdErrorForLogging(error));
       return { status: 'error' };
     }
   }
@@ -193,8 +238,8 @@ export class GoogleRewardedAdProvider implements RewardedAdProvider {
     session.showing = true;
     return await new Promise<RewardedAdResult>((resolve) => {
       session.resolveShow = resolve;
-      session.ad.show().catch(() => {
-        track('rewarded_ad_failed');
+      session.ad.show().catch((error) => {
+        track('rewarded_ad_failed', sanitizeAdErrorForLogging(error));
         this.finishSession(session, { status: 'error', message: 'The rewarded ad could not be shown.' });
       });
     });

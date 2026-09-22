@@ -19,12 +19,14 @@ import {
   characterizationService,
   type CharacterizationInput,
   type CharacterizationResult,
+  type CharacterizationStyle,
 } from '@/services/ai/characterization';
 import { rewardedAdProvider, type RewardedAdResult, type RewardedAdSsvCorrelation } from '@/services/ads';
 import { track } from '@/services/analytics/analytics';
 import { publicCharacterizedUrl, resolveDrawingUri } from '@/services/drawing/drawingAssets';
 import { colors, radius } from '@/theme';
 import type { PlayerId } from '@/types/game';
+import { WinnerAnimationVideo } from './WinnerAnimationVideo';
 
 type Phase = 'working' | 'ready' | 'failed';
 type RevealStep = 'choice' | 'characterizing' | 'characterized';
@@ -34,6 +36,42 @@ type RevealStep = 'choice' | 'characterizing' | 'characterized';
 // SSV -- never this client -- is what actually grants the entitlement;
 // these two states only ever reflect a READ of that server-side outcome.
 type RewardedAdUiState = 'idle' | 'requesting' | RewardedAdResult['status'] | 'verifying' | 'verified';
+
+// M4E step 4: the real-Veo generation sub-flow, entered only after
+// rewarded-ad-status has independently confirmed verified=true AND the
+// winner has explicitly pressed "GENERATE ANIMATION". This is a SEPARATE
+// state machine from `phase`/`AnimationJobStatus` above, which drive the
+// unrelated free/fake Characterize path (Milestone 1's local bounce/wiggle
+// demo) -- the two never interact, so Characterize keeps working exactly as
+// before regardless of anything below.
+//   idle -> requesting -> processing -> completed
+//                       \-> failed | ambiguous
+//   idle -> requesting -> error (start() itself rejected, e.g. a lost
+//     entitlement race -- no job/paid claim exists yet, so re-pressing is
+//     safe and IS allowed; 'failed'/'ambiguous' mean a job DOES exist in a
+//     terminal state and must never be retried from the client, per the
+//     M4C one-shot paid-generation invariant)
+type RealAnimationState = 'idle' | 'requesting' | 'processing' | 'completed' | 'failed' | 'ambiguous' | 'error';
+const ANIMATION_STATUS_POLL_MS = 5000;
+
+/**
+ * Characterization V2.1 Reveal cleanup: replaces the old fixed "REAL
+ * CHARACTER" badge with the real, server-selected style whenever one is
+ * known. A pre-V2 completed characterization legitimately returns
+ * `style: null` (see CharacterizationResult.style) -- that is not an
+ * error, and must render exactly like today's "REAL CHARACTER" badge
+ * rather than showing something broken or regenerating anything.
+ */
+const STYLE_BADGE_LABEL: Record<CharacterizationStyle, string> = {
+  cute: '✨ CUTE',
+  funny: '😂 FUNNY',
+  epic: '🔥 EPIC',
+  chibi: '🎀 CHIBI',
+  realistic: '📷 REALISTIC',
+  anime: '🎌 ANIME',
+  pixel_art: '🎮 PIXEL ART',
+  crayon: '🖍️ CRAYON',
+};
 
 // AI providers (fake or real) must never trap the player. Each stage gets its
 // own bound so one slow/failed call can't stall the whole reveal, plus an
@@ -176,9 +214,16 @@ export function RevealScreen() {
     reportAnimation,
     getRewardedAdCorrelation,
     getRewardedAdStatus,
+    getWinnerAnimationRevealStatus,
+    startWinnerAnimation,
   } = useGame();
   const [revealStep, setRevealStep] = useState<RevealStep>('choice');
   const [rewardedAdState, setRewardedAdState] = useState<RewardedAdUiState>('idle');
+  // M4E step 4: real-Veo generation state, entered only via the explicit
+  // "GENERATE ANIMATION" press -- see RealAnimationState above.
+  const [realAnimationState, setRealAnimationState] = useState<RealAnimationState>('idle');
+  const [realAnimationError, setRealAnimationError] = useState<{ code: string; message: string } | null>(null);
+  const [realVideoUrl, setRealVideoUrl] = useState<string | null>(null);
   // Server-issued, single-use SSV correlation token (see rewardedAdCorrelation.ts
   // and the M4E migration) -- fetched once per Reveal choice screen, BEFORE
   // the ad is requested, and passed to both prepare() and show() so
@@ -253,6 +298,60 @@ export function RevealScreen() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [revealStep, remoteRoom?.currentRoundId]);
+
+  // M4E step 4: observes an in-flight/existing real animation job via the
+  // EXISTING reveal-status recovery infrastructure -- this never starts or
+  // retries generation itself, only reads. Gated on realAnimationState
+  // (not revealStep), so it keeps observing even if the player has since
+  // pressed Characterize -- the server-side job is unaffected either way,
+  // this only controls whether THIS screen shows the outcome this visit.
+  useEffect(() => {
+    if (realAnimationState !== 'processing') return;
+    let cancelled = false;
+    let pollId: ReturnType<typeof setInterval> | undefined;
+    let announcedProcessing = false;
+
+    const poll = async () => {
+      const result = await getWinnerAnimationRevealStatus();
+      if (cancelled) return;
+      if (result.state === 'completed') {
+        cancelled = true;
+        if (pollId) clearInterval(pollId);
+        setRealVideoUrl(result.videoUrl);
+        setRealAnimationState('completed');
+        track('animation_generation_completed');
+        return;
+      }
+      if (result.state === 'failed' || result.state === 'ambiguous') {
+        cancelled = true;
+        if (pollId) clearInterval(pollId);
+        setRealAnimationState(result.state);
+        track('animation_generation_failed', { stage: 'provider', jobState: result.state });
+        return;
+      }
+      if (result.state === 'processing' && !announcedProcessing) {
+        announcedProcessing = true;
+        track('animation_generation_processing', { jobStatus: result.jobStatus });
+      }
+      // 'not_requested'/'error' here would mean a transient status-read
+      // hiccup right after a successful start -- never treated as failed;
+      // the next tick simply tries again. The job itself, and the one-shot
+      // paid-generation marker, are untouched by any of this.
+    };
+
+    void poll();
+    pollId = setInterval(() => void poll(), ANIMATION_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      if (pollId) clearInterval(pollId);
+    };
+    // getWinnerAnimationRevealStatus is a useCallback keyed on [identity,
+    // remoteRoom] -- remoteRoom is a new object on every realtime snapshot
+    // (same caveat documented at length on the animation effect below), so
+    // depending on its identity here would restart this interval on every
+    // snapshot instead of polling at a steady cadence.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [realAnimationState]);
 
   useEffect(() => {
     if (!state.judgeResult || !winner) {
@@ -403,11 +502,45 @@ export function RevealScreen() {
   // never inserts one, never calls a grant RPC, and never calls
   // animate-winner's 'start' action. One call per invocation, no loop.
   const checkRewardedAdVerification = async () => {
-    if (!mountedRef.current) return;
+    // Guards against duplicate work AND duplicate rewarded_ad_verified
+    // analytics: the bounded auto-check timer and the manual "CHECK
+    // STATUS" button can otherwise both fire after verification already
+    // succeeded (e.g. the user manually checked, then the 6s timer still
+    // fires). Once verified, this is a no-op -- there is nothing further
+    // to observe here, and generateRealAnimation below never re-checks it.
+    if (!mountedRef.current || rewardedAdState === 'verified') return;
     setRewardedAdState('verifying');
     const result = await getRewardedAdStatus();
     if (!mountedRef.current) return;
-    setRewardedAdState(result.status === 'checked' && result.verified ? 'verified' : 'earned');
+    const verified = result.status === 'checked' && result.verified;
+    setRewardedAdState(verified ? 'verified' : 'earned');
+    if (verified) track('rewarded_ad_verified');
+  };
+
+  // M4E step 4: the ONLY place in the client that calls animate-winner's
+  // 'start' action, and it only ever runs from this explicit press handler
+  // -- never automatically from a rewardedAdState/realAnimationState
+  // change. The server re-derives and re-validates the winner, winning
+  // submission, entitlement, and one-shot paid claim; this sends only the
+  // caller's own identity, never a submission id (see WinnerAnimationService.ts).
+  const generateRealAnimation = async () => {
+    if (realAnimationState !== 'idle' && realAnimationState !== 'error') return;
+    track('animation_generation_requested');
+    setRealAnimationError(null);
+    setRealAnimationState('requesting');
+    const result = await startWinnerAnimation();
+    if (!mountedRef.current) return;
+    if (result.state === 'error') {
+      track('animation_generation_failed', { code: result.code, stage: 'start' });
+      setRealAnimationError({ code: result.code, message: result.message });
+      setRealAnimationState('error');
+      return;
+    }
+    track('animation_generation_started', {
+      jobStatus: result.jobStatus,
+      paidGenerationRequestedThisCall: result.paidGenerationRequestedThisCall,
+    });
+    setRealAnimationState('processing');
   };
 
   const showRewardedAd = async () => {
@@ -498,9 +631,61 @@ export function RevealScreen() {
                 Checking with the ad network…
               </Text>
             ) : rewardedAdState === 'verified' ? (
-              <Text style={{ fontSize: 14, lineHeight: 20, color: colors.green }}>
-                Verified — animation unlock is ready. No animation request was made yet.
-              </Text>
+              <View style={{ gap: 10 }}>
+                {localPlayerId !== winner.id ? (
+                  // Only the round winner may press GENERATE ANIMATION --
+                  // animate-winner's 'start' action requires the caller to
+                  // BE the winner (verifyWinnerSubmission), matching who
+                  // the entitlement was issued for. The non-winner still
+                  // watched an ad and helped verify it, so this explains
+                  // why there's no button for them rather than showing one
+                  // that would deterministically fail.
+                  <Text style={{ fontSize: 14, lineHeight: 20, color: colors.green }}>
+                    Verified — {winner.name} can now generate the animation.
+                  </Text>
+                ) : realAnimationState === 'idle' ? (
+                  <>
+                    <Text style={{ fontSize: 14, lineHeight: 20, color: colors.green }}>
+                      Verified — ready to bring it to life.
+                    </Text>
+                    <Button label="GENERATE ANIMATION" size="lg" onPress={() => void generateRealAnimation()} />
+                  </>
+                ) : realAnimationState === 'requesting' ? (
+                  <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>Starting animation…</Text>
+                ) : realAnimationState === 'processing' ? (
+                  <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>
+                    Generating your real animation… this can take a minute or two.
+                  </Text>
+                ) : realAnimationState === 'completed' && realVideoUrl ? (
+                  <View style={{ alignItems: 'center', gap: 8 }}>
+                    <WinnerAnimationVideo
+                      uri={realVideoUrl}
+                      width={Math.min(windowWidth - 64, 320)}
+                      height={Math.min(windowWidth - 64, 320)}
+                      onPlaybackFailed={() => track('winner_animation_video_playback_failed')}
+                    />
+                    <Text style={{ fontSize: 13, color: colors.sub }}>Your real animation is ready.</Text>
+                  </View>
+                ) : realAnimationState === 'failed' || realAnimationState === 'ambiguous' ? (
+                  // Deliberately NO retry button here: a job already exists
+                  // in a terminal bad state, and the M4C one-shot
+                  // paid-generation guard must never be given a channel to
+                  // attempt a second Veo create for it from this client.
+                  <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>
+                    The animation could not be completed. Characterize and Continue are still available.
+                  </Text>
+                ) : realAnimationState === 'error' ? (
+                  // No job/paid claim exists yet in this case (the start()
+                  // call itself was rejected, e.g. a lost entitlement race)
+                  // -- retrying is safe and is the correct recovery.
+                  <>
+                    <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>
+                      {realAnimationError?.message ?? 'Animation could not be started.'}
+                    </Text>
+                    <Button label="TRY AGAIN" variant="link" onPress={() => void generateRealAnimation()} />
+                  </>
+                ) : null}
+              </View>
             ) : rewardedAdState === 'closed_without_reward' ? (
               <Text style={{ fontSize: 14, lineHeight: 20, color: colors.sub }}>
                 No reward was earned. You can try again, Characterize, or continue.
@@ -590,7 +775,10 @@ export function RevealScreen() {
 
   const rightBadge =
     isRemoteGame && realCharacterUri ? (
-      <Pill label="REAL CHARACTER" tone="green" />
+      <Pill
+        label={winnerCharacterization?.style ? STYLE_BADGE_LABEL[winnerCharacterization.style] : 'REAL CHARACTER'}
+        tone="green"
+      />
     ) : __DEV__ && isRemoteGame ? (
       <View style={{ backgroundColor: 'rgba(255,248,242,0.92)', borderRadius: radius.sm, paddingHorizontal: 6, paddingVertical: 3 }}>
         <Text style={{ fontSize: 9, fontWeight: '800', color: '#B5651D' }}>FAKE TRANSFORM (dev)</Text>
@@ -628,7 +816,7 @@ export function RevealScreen() {
           {/* Single bounded hero frame. position:'relative' + overflow:'hidden'
               is the containment: it clips anything inside it (the animated
               main character included) to this box, which is what actually
-              keeps the hero from ever overlapping the traits/caption/buttons
+              keeps the hero from ever overlapping the caption/buttons
               rendered *outside* this frame below. Everything inside is a
               layer within the SAME frame, not separate flex regions. */}
           <View
@@ -724,12 +912,6 @@ export function RevealScreen() {
                 {rightBadge}
               </View>
             ) : null}
-          </View>
-
-          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, justifyContent: 'center' }}>
-            {winner.drawing.traits.map((t) => (
-              <Pill key={t} label={t} />
-            ))}
           </View>
 
           <Text style={{ textAlign: 'center', color: colors.sub, fontSize: 13 }}>
