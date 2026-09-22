@@ -18,8 +18,6 @@ class JudgeRouter implements JudgeProvider {
 }
 
 export const judgeService: JudgeProvider = new JudgeRouter();
-/** Direct access to the fake provider — used as the explicit fallback when the router's real provider fails. */
-export const fakeJudgeService: JudgeProvider = fakeProvider;
 
 export type {
   JudgeContext,

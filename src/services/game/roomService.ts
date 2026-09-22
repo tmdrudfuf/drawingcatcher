@@ -28,6 +28,8 @@ interface GamePlayerRow {
   players: PlayerRow | null;
 }
 
+type JudgeStatus = 'pending' | 'judging' | 'completed' | 'failed';
+
 interface RoundRow {
   id: string;
   game_id: string;
@@ -35,6 +37,8 @@ interface RoundRow {
   prompt: string;
   status: RemoteRoundStatus;
   winner_player_id: string | null;
+  judge_status: JudgeStatus;
+  judge_error: string | null;
   judge_player1_score: number | null;
   judge_player2_score: number | null;
   judge_comment: string | null;
@@ -78,8 +82,15 @@ export interface RoomSnapshot {
   phase: RoundPhase;
   players: RemotePlayer[];
   winnerPlayerId: string | null;
-  /** Real Gemini judge result once judging completes; null while pending or if this round was force-advanced without one. */
+  /** Real Gemini judge result once judging completes; null while pending or on failure. */
   judgeSummary: JudgeSummary | null;
+  /**
+   * Server-authoritative judge state (see the M4B migration's judge_status
+   * column). 'failed' means judge-round genuinely failed and persisted an
+   * honest error -- it never implies a fabricated score/winner exists.
+   */
+  judgeStatus: JudgeStatus;
+  judgeError: string | null;
 }
 
 export type RoomListener = (snapshot: RoomSnapshot) => void;
@@ -153,7 +164,7 @@ export async function fetchRoomSnapshot(gameId: string): Promise<RoomSnapshot> {
     client
       .from('rounds')
       .select(
-        'id, game_id, round_number, prompt, status, winner_player_id, judge_player1_score, judge_player2_score, judge_comment, judge_player1_reason, judge_player2_reason',
+        'id, game_id, round_number, prompt, status, winner_player_id, judge_status, judge_error, judge_player1_score, judge_player2_score, judge_comment, judge_player1_reason, judge_player2_reason',
       )
       .eq('game_id', gameId)
       .eq('round_number', game.current_round_number)
@@ -185,6 +196,8 @@ export async function fetchRoomSnapshot(gameId: string): Promise<RoomSnapshot> {
     phase: toPhase(game, round),
     players: toRemotePlayers(playerRows ?? [], submissions ?? []),
     winnerPlayerId: round?.winner_player_id ?? null,
+    judgeStatus: round?.judge_status ?? 'pending',
+    judgeError: round?.judge_error ?? null,
     judgeSummary:
       round && round.judge_player1_score != null && round.judge_player2_score != null
         ? {
@@ -335,15 +348,6 @@ export async function submitDrawing(
     p_round_id: roundId,
     p_player_id: playerId,
     p_drawing_path: drawingPath,
-  });
-  if (error) throw new Error(error.message);
-}
-
-export async function completeJudging(gameId: string, roundId: string): Promise<void> {
-  const client = requireClient();
-  const { error } = await client.rpc('complete_fake_judging', {
-    p_game_id: gameId,
-    p_round_id: roundId,
   });
   if (error) throw new Error(error.message);
 }

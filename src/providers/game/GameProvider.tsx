@@ -21,7 +21,6 @@ import { buildRound, FAKE_PLAYERS } from '@/services/game/fakeData';
 import { getGuestIdentity, rotateGuestIdentity, type GuestIdentity } from '@/services/game/guestIdentity';
 import {
   beginDrawingRound,
-  completeJudging,
   createGame,
   endRemoteGame,
   fetchRoomSnapshot,
@@ -128,11 +127,18 @@ function remotePlayersForState(remote: RoomSnapshot | null): [Player, Player] {
  * judge's persisted scores/comment/reasons. `players` is already slot-sorted
  * (remotePlayersForState), and the judge-round Edge Function's player1/player2
  * naming is likewise slot 1/slot 2 — so this mapping is positional, not an id
- * lookup, matching the same convention buildDeterministicJudgeResult below
- * already uses.
+ * lookup.
+ *
+ * Trustworthy Core Step 1: returns null (never a fabricated winner) if the
+ * persisted row somehow has scores but no winner_player_id yet — judge-round
+ * always writes both in the same UPDATE, so this should not happen in
+ * practice, but silently defaulting to players[0] would turn a data
+ * integrity gap into a false "Player 1 wins" claim. Absence must stay
+ * absence.
  */
-function buildRealJudgeResult(players: [Player, Player], remote: RoomSnapshot): JudgeRoundResult {
+function buildRealJudgeResult(players: [Player, Player], remote: RoomSnapshot): JudgeRoundResult | null {
   const summary = remote.judgeSummary!;
+  if (!remote.winnerPlayerId) return null;
   return {
     players: [
       {
@@ -148,44 +154,9 @@ function buildRealJudgeResult(players: [Player, Player], remote: RoomSnapshot): 
         observations: summary.player2Reason ? [summary.player2Reason] : [],
       },
     ],
-    winnerPlayerId: remote.winnerPlayerId ?? players[0].id,
+    winnerPlayerId: remote.winnerPlayerId,
     comment: summary.comment,
     suspenseCues: [],
-  };
-}
-
-/**
- * Fallback-only, Milestone 4B onward: used when a round was force-advanced
- * via the complete_fake_judging RPC (the client's recovery path when real
- * Gemini judging fails or times out — see JudgeScreen) and therefore has no
- * real judge data to show. Deterministic placeholder, not a claim of an
- * actual AI verdict.
- */
-function buildDeterministicJudgeResult(players: [Player, Player], winnerPlayerId?: string | null): JudgeRoundResult {
-  const winner = winnerPlayerId ?? players[0].id;
-  return {
-    players: [
-      {
-        playerId: players[0].id,
-        score: 87,
-        recognized: true,
-        observations: ['cat detected', 'tiny legs', 'raised curved tail'],
-      },
-      {
-        playerId: players[1].id,
-        score: 74,
-        recognized: true,
-        observations: ['cat detected', 'unusually long legs', 'surprised face'],
-      },
-    ],
-    winnerPlayerId: winner,
-    comment: 'Those tiny legs somehow made the cat more powerful.',
-    suspenseCues: [
-      'CAT DETECTED',
-      'TINY LEGS DETECTED...',
-      'ANATOMY: QUESTIONABLE',
-      'ARTISTIC CONFIDENCE: SOMEHOW HIGH',
-    ],
   };
 }
 
@@ -210,14 +181,6 @@ export interface GameContextValue {
   submitDrawings: (pngBase64?: string) => Promise<boolean>;
   /** Local data: URI of this device's own submitted drawing — shown without re-download. */
   localDrawingUri: string | null;
-  /**
-   * Milestone 4B: force-advances the round via the deterministic
-   * complete_fake_judging RPC. No longer the primary judging path — the real
-   * Gemini judge-round Edge Function now does that (and advances the round
-   * itself on success). JudgeScreen calls this only as the failure-recovery
-   * action when real judging fails or times out, so the round is never stuck.
-   */
-  completeRemoteJudging: () => Promise<void>;
   markRemoteReveal: () => Promise<void>;
   reportJudgeResult: (result: JudgeRoundResult) => void;
   reportCharacterizations: (map: Partial<Record<PlayerId, CharacterizationResult>>) => void;
@@ -302,11 +265,15 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   const state = useMemo<GameState>(() => {
     if (!remoteRoom) return localState;
     const players = remotePlayersForState(remoteRoom);
+    // Trustworthy Core Step 1: a round only ever reaches these phases via a
+    // real completed judge-round write (see that function — it never
+    // advances rounds.status on failure), so remoteRoom.judgeSummary should
+    // already be present here. If it somehow is not, judgeResult stays null
+    // — never a fabricated 87/74 placeholder.
     const judgeResult =
-      remoteRoom.phase === 'results' || remoteRoom.phase === 'reveal' || remoteRoom.phase === 'complete'
-        ? remoteRoom.judgeSummary
-          ? buildRealJudgeResult(players, remoteRoom)
-          : buildDeterministicJudgeResult(players, remoteRoom.winnerPlayerId)
+      (remoteRoom.phase === 'results' || remoteRoom.phase === 'reveal' || remoteRoom.phase === 'complete') &&
+      remoteRoom.judgeSummary
+        ? buildRealJudgeResult(players, remoteRoom)
         : null;
 
     return {
@@ -554,11 +521,6 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         }
         dispatch({ type: 'SUBMIT_DRAWINGS' });
         return true;
-      },
-      completeRemoteJudging: async () => {
-        // Idempotent + server-derived winner, so either client may call it.
-        if (!remoteRoom?.currentRoundId) return;
-        await runRemote(() => completeJudging(remoteRoom.gameId, remoteRoom.currentRoundId!));
       },
       markRemoteReveal: async () => {
         if (!remoteRoom?.currentRoundId) return;

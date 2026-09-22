@@ -1,0 +1,29 @@
+-- Trustworthy Core Step 1: retire the production fake-judging mechanism.
+--
+-- public.complete_fake_judging(uuid, uuid) (introduced in the Milestone 2
+-- migration, 202609100001) is a SECURITY DEFINER function, granted to
+-- `anon`, that deterministically persists a fake winner (slot 1 always
+-- wins) with no real Gemini verdict behind it. The real judge-round Edge
+-- Function (Milestone 4B) has judged every real round since then; this RPC
+-- had exactly one remaining caller — GameProvider's `completeRemoteJudging`,
+-- called by JudgeScreen only as a client-side failure-recovery fallback —
+-- and that call site has just been removed as part of the same change that
+-- adds this migration (JudgeScreen now surfaces a real Judge failure
+-- honestly instead of forcing a fake winner through this RPC).
+--
+-- Confirmed via full-repository search immediately before writing this
+-- migration: no remaining TypeScript/JavaScript source, Edge Function, or
+-- test calls this RPC. The only remaining references anywhere in the repo
+-- are historical prose comments in later migrations and in
+-- supabase/functions/judge-round/index.ts, which do not execute it.
+--
+-- Because it is unreferenced everywhere and is also independently a live
+-- security concern (any anon-key holder could call it directly to force a
+-- fake winner on any in-progress round, regardless of whether real judging
+-- had actually failed), it is dropped outright here rather than merely
+-- having its anon grant revoked — the stronger of the two "preferred
+-- outcomes", and still scoped to this one function only. This migration
+-- makes no other change: no other function, table, policy, or grant is
+-- touched.
+
+drop function if exists public.complete_fake_judging(uuid, uuid);
