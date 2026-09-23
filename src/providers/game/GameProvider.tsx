@@ -477,8 +477,8 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         dispatch({ type: 'START_GAME' });
       },
       beginDrawing: async () => {
-        if (remoteRoom?.currentRoundId) {
-          await runRemote(() => beginDrawingRound(remoteRoom.currentRoundId!));
+        if (remoteRoom?.currentRoundId && identity) {
+          await runRemote(() => beginDrawingRound(remoteRoom.currentRoundId!, identity.playerId));
           return;
         }
         dispatch({ type: 'BEGIN_DRAWING' });
@@ -523,8 +523,8 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         return true;
       },
       markRemoteReveal: async () => {
-        if (!remoteRoom?.currentRoundId) return;
-        await runRemote(() => markReveal(remoteRoom.currentRoundId!));
+        if (!remoteRoom?.currentRoundId || !identity) return;
+        await runRemote(() => markReveal(remoteRoom.currentRoundId!, identity.playerId));
       },
       reportJudgeResult: (result) => {
         track('judge_completed', { winner: result.winnerPlayerId });
@@ -553,8 +553,8 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       endGame: async () => {
         track('game_ended', { rounds: state.roundNumber });
         setLocalDrawingUri(null);
-        if (remoteRoom) {
-          await runRemote(() => endRemoteGame(remoteRoom.gameId));
+        if (remoteRoom && identity) {
+          await runRemote(() => endRemoteGame(remoteRoom.gameId, identity.playerId));
           setRemoteRoom(null);
           return;
         }

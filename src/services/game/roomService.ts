@@ -307,9 +307,19 @@ export async function joinGame(roomCodeInput: string, playerId: string): Promise
   return fetchRoomSnapshot(game.id);
 }
 
+/**
+ * Trustworthy Core Step 2B: routed through the set_ready RPC instead of a
+ * direct game_players UPDATE -- the table no longer grants anon UPDATE at
+ * all (see the 202609100016 migration). The RPC re-verifies playerId is a
+ * member of gameId server-side before touching only that row's `ready`.
+ */
 export async function setReady(gameId: string, playerId: string, ready: boolean): Promise<void> {
   const client = requireClient();
-  const { error } = await client.from('game_players').update({ ready }).eq('game_id', gameId).eq('player_id', playerId);
+  const { error } = await client.rpc('set_ready', {
+    p_game_id: gameId,
+    p_player_id: playerId,
+    p_ready: ready,
+  });
   if (error) throw new Error(error.message);
 }
 
@@ -330,9 +340,18 @@ export async function startRoundIfReady(gameId: string, hostPlayerId: string): P
   if (error) throw new Error(error.message);
 }
 
-export async function beginDrawingRound(roundId: string): Promise<void> {
+/**
+ * Trustworthy Core Step 2B: routed through the begin_drawing_round RPC
+ * instead of a direct rounds UPDATE. The RPC resolves the round's game_id
+ * itself and verifies actorPlayerId is a member of it before transitioning
+ * prompt -> drawing; it never accepts an arbitrary status.
+ */
+export async function beginDrawingRound(roundId: string, actorPlayerId: string): Promise<void> {
   const client = requireClient();
-  const { error } = await client.from('rounds').update({ status: 'drawing' }).eq('id', roundId).eq('status', 'prompt');
+  const { error } = await client.rpc('begin_drawing_round', {
+    p_round_id: roundId,
+    p_actor_player_id: actorPlayerId,
+  });
   if (error) throw new Error(error.message);
 }
 
@@ -352,9 +371,16 @@ export async function submitDrawing(
   if (error) throw new Error(error.message);
 }
 
-export async function markReveal(roundId: string): Promise<void> {
+/**
+ * Trustworthy Core Step 2B: routed through the mark_round_reveal RPC
+ * instead of a direct rounds UPDATE. Same shape as beginDrawingRound above.
+ */
+export async function markReveal(roundId: string, actorPlayerId: string): Promise<void> {
   const client = requireClient();
-  const { error } = await client.from('rounds').update({ status: 'reveal' }).eq('id', roundId).eq('status', 'results');
+  const { error } = await client.rpc('mark_round_reveal', {
+    p_round_id: roundId,
+    p_actor_player_id: actorPlayerId,
+  });
   if (error) throw new Error(error.message);
 }
 
@@ -373,9 +399,19 @@ export async function requestNextRound(gameId: string, playerId: string): Promis
   if (error) throw new Error(error.message);
 }
 
-export async function endRemoteGame(gameId: string): Promise<void> {
+/**
+ * Trustworthy Core Step 2B: routed through the end_game RPC instead of a
+ * direct games UPDATE. Membership-checked, not host-only -- either player
+ * may end the game, matching prior behavior (Next Round's "END GAME" and
+ * the Judge-failure screen's "EXIT TO HOME" are both reachable by either
+ * player).
+ */
+export async function endRemoteGame(gameId: string, actorPlayerId: string): Promise<void> {
   const client = requireClient();
-  const { error } = await client.from('games').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', gameId);
+  const { error } = await client.rpc('end_game', {
+    p_game_id: gameId,
+    p_actor_player_id: actorPlayerId,
+  });
   if (error) throw new Error(error.message);
 }
 
