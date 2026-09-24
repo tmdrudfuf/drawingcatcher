@@ -7,14 +7,24 @@ export interface CharacterizationContext {
 }
 
 /**
- * Characterization V2 (Milestone 4F). Mirrors
- * supabase/functions/characterize-drawing/prompt.ts's STYLE_KEYS exactly —
- * duplicated here (not imported) because the client and the Deno edge
- * function are separate module-resolution contexts, same reason
- * src/services/ads/admobConfig.ts's constants are duplicated into
+ * Characterization V2 (Milestone 4F). Duplicated (not imported) from
+ * supabase/functions/characterize-drawing/prompt.ts because the client and
+ * the Deno edge function are separate module-resolution contexts, same
+ * reason src/services/ads/admobConfig.ts's constants are duplicated into
  * app.config.ts rather than imported. The server is the sole source of
  * truth for VALUE selection (see selectStyle() there); this is only the
  * shape of what it may return.
+ *
+ * NOTE this list is intentionally WIDER than the server's active
+ * STYLE_KEYS: 'realistic' was removed from active generation there (it
+ * can never be selected for a new characterization), but historical rows
+ * already have characterization_style = 'realistic' persisted, and this
+ * list is what RevealScreen's isCharacterizationStyle() guard uses to
+ * decide whether a stored style is safe to render a badge for -- dropping
+ * it here would make old 'realistic' rows fail that guard and fall back
+ * to the null/unknown-style badge instead of their real one. This is
+ * legacy DISPLAY compatibility only; it has no bearing on what the server
+ * will ever select next.
  */
 export const CHARACTERIZATION_STYLES = [
   'cute',

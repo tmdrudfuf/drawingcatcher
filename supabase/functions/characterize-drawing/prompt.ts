@@ -40,12 +40,24 @@
 // Higher priorities always override lower priorities. The AI's role is
 // primarily to RENDER THE DRAWING, not to create a scene inspired by it.
 
+// 'realistic' was removed from active generation (product principle:
+// "preserve first, stylize second" -- real-device testing showed it
+// producing what read as a newly generated real animal rather than the
+// player's drawing brought to life). It is NOT re-added here: this array
+// is the sole source of truth for both future selection (selectStyle())
+// and validation (isCharacterizationStyle()), so removing it here means
+// selectStyle() can never choose it and isCharacterizationStyle() now
+// rejects it. Historical rows with characterization_style = 'realistic'
+// are untouched (no migration, no backfill) and remain valid to store
+// and read -- this array only governs what NEW rows may be stamped with;
+// display of old rows is a separate, client-side concern (see
+// src/services/ai/characterization/CharacterizationProvider.ts's
+// CHARACTERIZATION_STYLES, which intentionally still includes it).
 export const STYLE_KEYS = [
   'cute',
   'funny',
   'epic',
   'chibi',
-  'realistic',
   'anime',
   'pixel_art',
   'crayon',
@@ -71,7 +83,7 @@ export function isCharacterizationStyle(value: unknown): value is Characterizati
  *
  * djb2 string hash — not cryptographic, doesn't need to be; just
  * deterministic and close enough to uniform over high-entropy UUIDs for
- * "approximately even distribution across 8 buckets".
+ * "approximately even distribution across 7 buckets".
  */
 export function selectStyle(submissionId: string): CharacterizationStyle {
   let hash = 5381;
@@ -460,16 +472,6 @@ chibi-like visual language: soft forms, charming expression, playful
 polished rendering. The original drawing's proportions remain the
 authority -- if the sketch already has a huge head and tiny body, lean
 into that; if it has a long thin body, CHIBI must not force it short.`,
-
-  realistic: `STYLE: REALISTIC (rendering language only, never composition or content)
-
-Make the impossible original anatomy look physically rendered: realistic
-materials (fur, skin, surface as appropriate), physically believable
-lighting, photographic dimensionality. Do not make the anatomy realistic
-or correct -- if the sketch shows an impossibly long cat with tiny legs,
-the result is a photoreal impossibly long cat with tiny legs. The
-strangeness is the point, rendered as if it were real, not corrected
-because reality "doesn't work that way."`,
 
   anime: `STYLE: ANIME (rendering language only, never composition or content)
 

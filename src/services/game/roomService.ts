@@ -55,6 +55,9 @@ export interface JudgeSummary {
   player2Reason: string | null;
 }
 
+/** Mirrors round_submissions.characterization_status's check constraint (M4A/M4A-concurrency migrations). */
+export type CharacterizationDbStatus = 'pending' | 'generating' | 'completed' | 'failed';
+
 interface SubmissionRow {
   id: string;
   round_id: string;
@@ -62,6 +65,9 @@ interface SubmissionRow {
   submitted: boolean;
   submitted_at: string | null;
   drawing_path: string | null;
+  characterization_status: CharacterizationDbStatus;
+  characterized_path: string | null;
+  characterization_style: string | null;
 }
 
 export interface RemotePlayer extends Player {
@@ -69,6 +75,18 @@ export interface RemotePlayer extends Player {
   ready: boolean;
   wantsNextRound: boolean;
   submitted: boolean;
+  /**
+   * M6C: server-authoritative, round-scoped characterization state for this
+   * player's CURRENT-round submission -- round_submissions.round_id already
+   * ties this to exactly the round fetchRoomSnapshot queried below, so this
+   * can never be a previous round's leftover value the way the client-side
+   * `state.characterizations` map (keyed only by playerId) could be. Both
+   * devices read the same row via the same already-subscribed Realtime
+   * channel, so they always agree on this value.
+   */
+  characterizationStatus: CharacterizationDbStatus;
+  characterizedPath: string | null;
+  characterizationStyle: string | null;
 }
 
 export interface RoomSnapshot {
@@ -133,6 +151,9 @@ function toRemotePlayers(rows: GamePlayerRow[], submissions: SubmissionRow[]): R
         wantsNextRound: row.wants_next_round,
         // A player counts as submitted only once their drawing asset exists.
         submitted: Boolean(submission?.submitted && submission?.drawing_path),
+        characterizationStatus: submission?.characterization_status ?? 'pending',
+        characterizedPath: submission?.characterized_path ?? null,
+        characterizationStyle: submission?.characterization_style ?? null,
         drawing: {
           playerId: row.player_id,
           sketchVariant: variant,
@@ -179,7 +200,9 @@ export async function fetchRoomSnapshot(gameId: string): Promise<RoomSnapshot> {
   const { data: submissions, error: submissionsError } = round
     ? await client
         .from('round_submissions')
-        .select('id, round_id, player_id, submitted, submitted_at, drawing_path')
+        .select(
+          'id, round_id, player_id, submitted, submitted_at, drawing_path, characterization_status, characterized_path, characterization_style',
+        )
         .eq('round_id', round.id)
         .returns<SubmissionRow[]>()
     : { data: [], error: null };

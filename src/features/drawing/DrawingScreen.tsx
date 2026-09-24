@@ -72,24 +72,26 @@ export function DrawingScreen() {
 
   return (
     <Screen>
-      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+      <View style={{ gap: 6 }}>
         <Text style={{ fontSize: 17, fontWeight: '800', textTransform: 'uppercase', color: colors.ink }}>
           {state.prompt || 'Draw a cat'}
         </Text>
-        <Text
-          style={{
-            fontSize: 16,
-            fontWeight: '800',
-            color: low ? '#C0392B' : colors.coralInk,
-            borderWidth: 2,
-            borderColor: low ? '#E7B0A6' : '#ECCDB9',
-            borderRadius: 999,
-            paddingHorizontal: 10,
-            paddingVertical: 2,
-          }}
-        >
-          {mm}:{ss}
-        </Text>
+        <View style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
+          <Text
+            style={{
+              fontSize: 16,
+              fontWeight: '800',
+              color: low ? '#C0392B' : colors.coralInk,
+              borderWidth: 2,
+              borderColor: low ? '#E7B0A6' : '#ECCDB9',
+              borderRadius: 999,
+              paddingHorizontal: 10,
+              paddingVertical: 2,
+            }}
+          >
+            {mm}:{ss}
+          </Text>
+        </View>
       </View>
 
       {/* key by round so Round 2 always starts on a blank canvas with no stale asset */}

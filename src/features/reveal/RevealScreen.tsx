@@ -1,6 +1,6 @@
 import { router } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { Alert, Animated, Easing, Image, Platform, Text, useWindowDimensions, View } from 'react-native';
+import { Animated, Easing, Image, Platform, Text, useWindowDimensions, View } from 'react-native';
 
 import { CatDoodle } from '@/components/game/CatDoodle';
 import { MotionCat } from '@/components/game/MotionCat';
@@ -17,6 +17,7 @@ import {
 } from '@/services/ai/animation';
 import {
   characterizationService,
+  isCharacterizationStyle,
   type CharacterizationInput,
   type CharacterizationResult,
   type CharacterizationStyle,
@@ -491,8 +492,49 @@ export function RevealScreen() {
 
   if (!winner) return <Screen />;
 
+  // M6C: server-authoritative, round-scoped characterization visibility.
+  // remoteRoom.players comes from round_submissions rows already scoped to
+  // the CURRENT round (see roomService.ts's fetchRoomSnapshot), delivered to
+  // both devices over the same already-subscribed Realtime channel -- so
+  // this can never be a previous round's leftover the way local component
+  // state could be, and both devices always agree on it without polling.
+  const winnerSubmission = isRemoteGame ? remoteRoom?.players.find((p) => p.id === winner.id) : undefined;
+  const remoteCharacterizationReady = Boolean(
+    isRemoteGame && winnerSubmission?.characterizationStatus === 'completed' && winnerSubmission.characterizedPath,
+  );
+  const remoteCharacterizationInProgress = isRemoteGame && winnerSubmission?.characterizationStatus === 'generating';
+  // M6D: current-round-only, honest failure signal for the player who did
+  // NOT attempt characterization -- never claims a transformation exists,
+  // never shows the generic mascot, never auto-retries or auto-triggers
+  // anything. Purely a read of already-round-scoped server state.
+  const remoteCharacterizationFailed = isRemoteGame && winnerSubmission?.characterizationStatus === 'failed';
+
   const chooseCharacterize = () => {
     track('bring_to_life_characterize_selected');
+    if (remoteCharacterizationReady && winnerSubmission?.characterizedPath) {
+      // Already completed for THIS round -- reuse the shared result directly
+      // instead of making another characterize-drawing request. Both
+      // devices converge on the identical asset because they read the same
+      // round_submissions row.
+      const style = isCharacterizationStyle(winnerSubmission.characterizationStyle)
+        ? winnerSubmission.characterizationStyle
+        : null;
+      const winnerDrawing = winner.drawing;
+      const result: CharacterizationResult = {
+        sourceSketchVariant: winnerDrawing.sketchVariant,
+        characterAsset: winnerDrawing.sketchVariant,
+        preservedTraits: winnerDrawing.traits,
+        styleNote: 'shared — already completed for this round',
+        characterizedImagePath: winnerSubmission.characterizedPath,
+        style,
+      };
+      setWinnerCharacterization(result);
+      reportCharacterizations({ [winner.id]: result });
+      setMotions([]);
+      setPhase('ready');
+      setRevealStep('characterized');
+      return;
+    }
     setRevealStep('characterizing');
   };
 
@@ -571,6 +613,57 @@ export function RevealScreen() {
           What should happen to this wonderfully weird winner?
         </Text>
 
+        {remoteCharacterizationReady ? (
+          <View
+            style={{
+              gap: 8,
+              padding: 14,
+              borderWidth: 2,
+              borderColor: colors.coral,
+              borderRadius: radius.lg,
+              backgroundColor: colors.coralTint,
+              alignItems: 'center',
+            }}
+          >
+            <Text style={{ fontSize: 16, fontWeight: '800', color: colors.ink, textAlign: 'center' }}>
+              ✨ The transformation is ready!
+            </Text>
+            <Button label="SEE IT NOW" size="lg" onPress={chooseCharacterize} />
+          </View>
+        ) : remoteCharacterizationInProgress ? (
+          <View
+            style={{
+              padding: 14,
+              borderWidth: 2,
+              borderColor: colors.line,
+              borderRadius: radius.lg,
+              backgroundColor: colors.card,
+            }}
+          >
+            <Text style={{ fontSize: 15, color: colors.sub, textAlign: 'center' }}>
+              🎨 {winner.name}&apos;s drawing is being brought to life…
+            </Text>
+          </View>
+        ) : remoteCharacterizationFailed ? (
+          <View
+            style={{
+              gap: 4,
+              padding: 14,
+              borderWidth: 2,
+              borderColor: colors.line,
+              borderRadius: radius.lg,
+              backgroundColor: colors.card,
+            }}
+          >
+            <Text style={{ fontSize: 15, fontWeight: '800', color: colors.ink, textAlign: 'center' }}>
+              Couldn&apos;t bring this one to life.
+            </Text>
+            <Text style={{ fontSize: 14, color: colors.sub, textAlign: 'center' }}>
+              You can still continue with the original sketch.
+            </Text>
+          </View>
+        ) : null}
+
         <View style={{ gap: 12 }}>
           <View
             style={{
@@ -605,6 +698,11 @@ export function RevealScreen() {
             <Text style={{ fontSize: 15, lineHeight: 21, color: colors.sub }}>
               Watch an ad to turn the character into a short animation shared with both players.
             </Text>
+            {localPlayerId !== winner.id ? (
+              <Text style={{ fontSize: 13, lineHeight: 18, color: colors.faint }}>
+                Only {winner.name} can start the generation — watching helps unlock it for them.
+              </Text>
+            ) : null}
             <Button
               label="WATCH AD & ANIMATE"
               variant="ghost"
@@ -717,6 +815,12 @@ export function RevealScreen() {
   const realCharacterUri = isRemoteGame
     ? publicCharacterizedUrl(winnerCharacterization?.characterizedImagePath)
     : null;
+  // M6B: a real Duo game with no real Gemini image is an honest failure --
+  // never render the generic mascot as though it were the transformed
+  // drawing. Local/demo mode never has a real image by design (no Gemini
+  // call is ever attempted there), so it is deliberately excluded here and
+  // keeps its existing MotionCat/CatDoodle behavior below.
+  const characterizationFailed = isRemoteGame && !realCharacterUri;
 
   // No content-width cap: the Reveal composition uses the full width Screen
   // gives it (Screen's own small fixed page padding is the only horizontal
@@ -810,7 +914,11 @@ export function RevealScreen() {
               lineHeight: 27,
             }}
           >
-            THAT weird drawing{'\n'}is now alive.
+            {characterizationFailed ? (
+              "COULDN'T BRING THIS ONE TO LIFE"
+            ) : (
+              <>THAT weird drawing{'\n'}is now alive.</>
+            )}
           </Text>
 
           {/* Single bounded hero frame. position:'relative' + overflow:'hidden'
@@ -857,6 +965,12 @@ export function RevealScreen() {
                   height={heroHeight}
                   label={`${winner.id}-characterized`}
                 />
+              ) : characterizationFailed ? (
+                // Honest failure: the player's real original sketch, never
+                // the generic mascot presented as though it were their
+                // transformed drawing. RemoteDrawing already handles a
+                // still-pending/unavailable URI gracefully on its own.
+                <RemoteDrawing uri={winnerSketchUri} size={heroFallbackSize} label={`${winner.id}-original-fallback`} />
               ) : phase === 'ready' ? (
                 <MotionCat key={replayKey} variant={v} size={heroFallbackSize} motions={motions} />
               ) : (
@@ -915,27 +1029,21 @@ export function RevealScreen() {
           </View>
 
           <Text style={{ textAlign: 'center', color: colors.sub, fontSize: 13 }}>
-            {realCharacterUri
-              ? '✨ your sketch, transformed by Gemini'
-              : phase === 'failed'
-                ? 'couldn’t animate this one — here’s your character'
+            {characterizationFailed
+              ? 'Your original sketch is safe.'
+              : realCharacterUri
+                ? '✨ your sketch, transformed by Gemini'
                 : `▶ short loop · ${motions.join(' · ')}`}
           </Text>
 
-          <View style={{ flexDirection: 'row', gap: 8 }}>
-            <Button
-              style={{ flex: 1 }}
-              variant="ghost"
-              label="REPLAY"
-              onPress={() => setReplayKey((k) => k + 1)}
-            />
-            <Button
-              style={{ flex: 1 }}
-              variant="ghost"
-              label="SHARE"
-              onPress={() => Alert.alert('Share', 'Sharing is stubbed for Milestone 1.')}
-            />
-          </View>
+          <Button
+            variant="ghost"
+            label="REPLAY"
+            onPress={() => setReplayKey((k) => k + 1)}
+          />
+          {/* SHARE removed: no real sharing implementation exists yet, and a
+              button that only shows a developer-facing "stubbed" alert must
+              never be user-reachable. Re-add once real sharing exists. */}
         </>
       )}
 

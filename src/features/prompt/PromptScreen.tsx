@@ -42,12 +42,19 @@ export function PromptScreen() {
           alignSelf: 'stretch',
         }}
       >
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          <CatDoodle variant="p1" size={48} />
-          <Text style={{ fontSize: 30, fontWeight: '900', color: colors.ink, textTransform: 'uppercase' }}>
-            {state.prompt || 'Draw a cat'}
-          </Text>
-        </View>
+        <CatDoodle variant="p1" size={48} />
+        <Text
+          style={{
+            fontSize: 30,
+            fontWeight: '900',
+            color: colors.ink,
+            textTransform: 'uppercase',
+            textAlign: 'center',
+            alignSelf: 'stretch',
+          }}
+        >
+          {state.prompt || 'Draw a cat'}
+        </Text>
         <Text style={{ fontSize: 13, fontWeight: '800', color: colors.sub, letterSpacing: 1 }}>
           {timing.roundSeconds} SECONDS
         </Text>

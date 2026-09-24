@@ -13,13 +13,22 @@ import {
   type CharacterizationStyle,
 } from './prompt.ts';
 
-// -- 1. all 8 styles still work ----------------------------------------------
-Deno.test('STYLE_KEYS has exactly the 8 approved styles, no more, no fewer', () => {
-  assertEquals(STYLE_KEYS.length, 8);
+// -- 1. all 7 active styles still work ---------------------------------------
+Deno.test('STYLE_KEYS has exactly the 7 approved active styles, no more, no fewer', () => {
+  assertEquals(STYLE_KEYS.length, 7);
   assertEquals(
     [...STYLE_KEYS].sort(),
-    ['anime', 'chibi', 'crayon', 'cute', 'epic', 'funny', 'pixel_art', 'realistic'].sort(),
+    ['anime', 'chibi', 'crayon', 'cute', 'epic', 'funny', 'pixel_art'].sort(),
   );
+});
+
+Deno.test('realistic was removed from active generation and can never be selected', () => {
+  assertFalse((STYLE_KEYS as readonly string[]).includes('realistic'));
+  assertFalse(isCharacterizationStyle('realistic'));
+  for (let i = 0; i < 500; i += 1) {
+    const selected: string = selectStyle(`fake-submission-id-${i}`);
+    assertNotEquals(selected, 'realistic');
+  }
 });
 
 Deno.test('every style key produces a prompt containing its own STYLE header', () => {
@@ -28,7 +37,6 @@ Deno.test('every style key produces a prompt containing its own STYLE header', (
     funny: 'STYLE: FUNNY',
     epic: 'STYLE: EPIC',
     chibi: 'STYLE: CHIBI',
-    realistic: 'STYLE: REALISTIC',
     anime: 'STYLE: ANIME',
     pixel_art: 'STYLE: PIXEL ART',
     crayon: 'STYLE: CRAYON',
@@ -184,7 +192,7 @@ Deno.test('anatomy and composition redesign remain explicitly forbidden alongsid
 
 // -- 8. priority order is explicit, six levels, higher wins on conflict -----
 Deno.test('the prompt states an explicit six-level priority order, with higher priorities always overriding lower ones', () => {
-  const prompt = buildCharacterizationPrompt('Superhero Cat', 'realistic');
+  const prompt = buildCharacterizationPrompt('Superhero Cat', 'epic');
   assert(prompt.includes('PRIORITY ORDER (read this before anything else)'));
   assert(prompt.includes('1. ORIGINAL DRAWING IDENTITY (highest)'));
   assert(prompt.includes('2. ORIGINAL COMPOSITION'));
@@ -197,7 +205,7 @@ Deno.test('the prompt states an explicit six-level priority order, with higher p
 });
 
 Deno.test('the core mantra states preserve/composition/stylize/invent-almost-nothing, and frames the AI as rendering, not creating', () => {
-  const prompt = buildCharacterizationPrompt('Superhero Cat', 'realistic');
+  const prompt = buildCharacterizationPrompt('Superhero Cat', 'epic');
   assert(prompt.includes('PRESERVE FIRST. COMPOSITION SECOND. STYLIZE THIRD. INVENT ALMOST NOTHING.'));
   assert(prompt.includes('primarily to RENDER THE DRAWING -- not to create a\nscene inspired by the drawing.'));
 });
@@ -288,7 +296,6 @@ Deno.test('every style block frames itself as rendering language only, never com
     funny: 'Every funny element in the result must trace back to something already\ndrawn.',
     epic: 'Epic means a stronger RENDERING treatment of the exact same sketch, not\na new scene.',
     chibi: "drawing's proportions remain the\nauthority",
-    realistic: 'Do not make the anatomy realistic\nor correct',
     anime: 'Do not redesign the subject as a conventional anime character. Preserve\nthe exact strange structure',
     pixel_art: 'Render at a size and clarity large enough to\nremain a single clear, detailed character image',
     crayon: 'do not clean up its linework, proportions, or composition in the process\nof adding crayon texture.',
@@ -551,7 +558,7 @@ Deno.test('the bear/pizza, dinosaur/bike, robot/battery, and cow/balloon worked 
   // These are static illustrative examples baked into the instruction
   // template itself (see buildRoundConcept) -- present regardless of what
   // the actual current round prompt is.
-  const prompt = buildCharacterizationPrompt("A dragon whose fire won't work", 'realistic');
+  const prompt = buildCharacterizationPrompt("A dragon whose fire won't work", 'epic');
   assert(prompt.includes('"A bear caught stealing pizza"'));
   assert(prompt.includes('never a restaurant, a chef, a police officer, a cash register'));
   assert(prompt.includes('"A dinosaur riding a tiny bike"'));
